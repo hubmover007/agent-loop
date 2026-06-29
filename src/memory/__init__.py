@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
-from surrealdb import Surreal
+if TYPE_CHECKING:
+    from surrealdb import Surreal
 
 from ..core import MemoryLayer
 
