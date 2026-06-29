@@ -11,7 +11,7 @@ from typing import Any
 
 from ..core import (
     AgentStatus, TaskStatus, TaskResult, EvaluationResult,
-    DiscardRecord, ExpertProfile,
+    DiscardRecord, ExpertProfile, AgentRole,
 )
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,8 @@ class Agent:
     """An agent instance in the system."""
     agent_id: str
     status: AgentStatus = AgentStatus.IDLE
+    role: AgentRole = AgentRole.WORKER
+    expertise: list[str] = field(default_factory=list)  # tool names this agent is good at
     created_at: datetime = field(default_factory=datetime.now)
     task_count: int = 0
     success_count: int = 0

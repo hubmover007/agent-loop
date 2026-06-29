@@ -15,7 +15,7 @@ from .deep_reason import DeepReasonLoop, DeepReasonConfig
 from ..core import LoopPhase, TaskStatus, ToolResult, DiscardRecord
 from ..memory import MemoryPool
 from ..memory.graph_route import GraphRouter
-from ..pipeline import TaskPipeline
+from ..task_manager import TaskManagerAgent
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +39,8 @@ class MainLoop:
             confidence_threshold=self.config.reason_confidence_threshold,
         ))
 
-        # Unified task pipeline (replaces fragmented TaskScheduler + AgentOrchestrator)
-        self.pipeline: TaskPipeline | None = None
+        # TaskManager Agent (central orchestrator for task lifecycle)
+        self.task_manager: TaskManagerAgent | None = None
 
     # ============================================================
     # 1. INPUT
@@ -128,19 +128,19 @@ class MainLoop:
     # ============================================================
 
     async def _decompose(self, ctx: LoopContext) -> None:
-        """Decompose reasoning output into tasks via unified pipeline."""
+        """TaskManager Agent decomposes reasoning into subtasks."""
         ctx.current_phase = LoopPhase.DECOMPOSE
 
-        if not self.pipeline:
-            self.pipeline = TaskPipeline(
+        if not self.task_manager:
+            self.task_manager = TaskManagerAgent(
                 memory=self.memory,
                 llm=self.llm,
                 agent_loop=self.agent_loop,
                 config=self.config,
             )
 
-        # Unified: LLM decompose → TaskTree build → dependency resolution
-        tasks = await self.pipeline.decompose(
+        # TaskManager uses LLM to decompose + register tasks
+        tasks = await self.task_manager.decompose(
             reasoning_output=ctx.reason_output,
             original_input=ctx.user_input,
         )
@@ -153,53 +153,55 @@ class MainLoop:
     # ============================================================
 
     async def _dispatch(self, ctx: LoopContext) -> None:
-        """Dispatch ready tasks to agents via unified pipeline.
+        """TaskManager Agent dispatches ready tasks to worker agents.
 
-        The pipeline handles:
-          - Dependency-aware scheduling (only dispatch tasks whose deps are done)
-          - Agent routing (find best agent or create new)
-          - Async execution (each task runs as asyncio task)
+        The TaskManager handles:
+          - Dependency-aware scheduling
+          - Worker agent routing (MoE)
+          - Async execution launch
         """
         ctx.current_phase = LoopPhase.DISPATCH
 
-        if not self.pipeline:
-            ctx.errors.append("Pipeline not initialized")
+        if not self.task_manager:
+            ctx.errors.append("TaskManager not initialized")
             return
 
-        # Dispatch all ready tasks (respecting dependencies)
-        dispatched = await self.pipeline.dispatch_ready()
-        logger.info("MainLoop[%s]: DISPATCH → %d agents launched", ctx.session_id, len(dispatched))
+        dispatched = await self.task_manager.dispatch_ready()
+        logger.info("MainLoop[%s]: DISPATCH → %d workers launched",
+                    ctx.session_id, len(dispatched))
 
     # ============================================================
     # 6. COLLECT
     # ============================================================
 
     async def _collect(self, ctx: LoopContext) -> None:
-        """Collect results from all tasks via unified pipeline.
+        """TaskManager Agent collects results from all worker agents.
 
-        Waits for all in-flight tasks, then gathers results.
-        Failed tasks are retried by the pipeline automatically.
+        Waits for all in-flight tasks, gathers results.
+        Failed tasks may trigger re-planning by the TaskManager.
         """
         ctx.current_phase = LoopPhase.COLLECT
 
-        if not self.pipeline:
-            ctx.errors.append("Pipeline not initialized")
+        if not self.task_manager:
+            ctx.errors.append("TaskManager not initialized")
             return
 
         # Wait for all tasks to complete
-        results = await self.pipeline.collect_all(timeout=300.0)
+        results = await self.task_manager.collect_all(timeout=300.0)
 
         for task_id, result in results.items():
             ctx.agent_results.append(result)
 
-        # Check for failed tasks
-        for task in self.pipeline.all_tasks():
+        # Check for failed tasks — attempt re-planning
+        for task in self.task_manager.registry.all_tasks():
             if task.status == TaskStatus.FAILED:
                 ctx.discarded_results.append(task.task_id)
                 ctx.errors.append(f"Task {task.task_id} failed: {task.error}")
-            elif task.status == TaskStatus.DONE and task.task_id not in results:
-                # Done but no result object — still counts as success
-                pass
+
+                # TaskManager can re-plan failed tasks
+                # new_tasks = await self.task_manager.replan(task)
+                # if new_tasks:
+                #     await self.task_manager.dispatch_ready()
 
         logger.info(
             "MainLoop[%s]: COLLECT → %d results, %d failed",

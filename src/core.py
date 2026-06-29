@@ -118,6 +118,14 @@ class ExpertProfile:
     specialties: list[str] = field(default_factory=list)
 
 
+class AgentRole(str, Enum):
+    """Role of an agent in the system."""
+    MANAGER = "manager"      # TaskManager: decompose, dispatch, collect
+    WORKER = "worker"        # Worker: execute subtasks
+    EXPERT = "expert"        # Domain specialist (SSH, code, web, etc.)
+    OBSERVER = "observer"    # Read-only, monitoring
+
+
 __all__ = [
     "TaskStatus",
     "AgentStatus",
@@ -130,4 +138,5 @@ __all__ = [
     "EvaluationResult",
     "DiscardRecord",
     "ExpertProfile",
+    "AgentRole",
 ]
