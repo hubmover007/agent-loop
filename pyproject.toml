@@ -1,0 +1,46 @@
+[project]
+name = "agent-loop"
+version = "0.1.0"
+description = "Loop Engine AI Agent System with shared memory, automatic agent orchestration, and deep reasoning"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [
+    { name = "张云飞", email = "zhangyunfei@cmcm.com" }
+]
+keywords = ["ai", "agent", "loop-engine", "memory", "orchestration"]
+
+dependencies = [
+    "surrealdb>=0.3.0",
+    "pydantic>=2.0",
+    "httpx>=0.27",
+    "rich>=13.0",
+    "click>=8.0",
+    "structlog>=24.0",
+    "tenacity>=8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+]
+all = [
+    "openai>=1.0",
+    "anthropic>=0.40",
+]
+
+[project.scripts]
+agent-loop = "agent_loop.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

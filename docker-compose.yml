@@ -1,0 +1,34 @@
+services:
+  surrealdb:
+    image: surrealdb/surrealdb:latest
+    volumes:
+      - ./data:/data
+    command: start --user root --pass root file:/data/agent_loop.db
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  loop-engine:
+    build: .
+    environment:
+      - SURREAL_URL=ws://surrealdb:8000
+      - LLM_PROVIDER=${LLM_PROVIDER:-deepseek}
+      - LLM_API_KEY=${LLM_API_KEY}
+    ports:
+      - "8080:8080"
+    depends_on:
+      - surrealdb
+    restart: unless-stopped
+
+  agent-worker:
+    build: .
+    command: agent-loop worker
+    environment:
+      - SURREAL_URL=ws://surrealdb:8000
+      - LLM_PROVIDER=${LLM_PROVIDER:-deepseek}
+      - LLM_API_KEY=${LLM_API_KEY}
+    deploy:
+      replicas: 3
+    depends_on:
+      - surrealdb
+    restart: unless-stopped
