@@ -1,46 +1,47 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
 [project]
 name = "agent-loop"
 version = "0.1.0"
-description = "Loop Engine AI Agent System with shared memory, automatic agent orchestration, and deep reasoning"
+description = "Loop Engine for AI Agent orchestration — shared memory, auto task decomposition, agent lifecycle management"
 readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.12"
-license = { text = "MIT" }
 authors = [
-    { name = "张云飞", email = "zhangyunfei@cmcm.com" }
+    {name = "Zhang Yunfei", email = "zhangyunfei@cmcm.com"},
 ]
-keywords = ["ai", "agent", "loop-engine", "memory", "orchestration"]
-
+keywords = ["ai", "agent", "loop-engine", "orchestration", "multi-agent", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
-    "surrealdb>=0.3.0",
-    "pydantic>=2.0",
     "httpx>=0.27",
-    "rich>=13.0",
-    "click>=8.0",
-    "structlog>=24.0",
-    "tenacity>=8.0",
+    "pydantic>=2.0",
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.24",
-    "ruff>=0.6",
-]
-all = [
-    "openai>=1.0",
-    "anthropic>=0.40",
-]
+web = ["fastapi>=0.110", "uvicorn>=0.29"]
+db = ["surrealdb>=2.0"]
+aws = ["boto3>=1.34"]
+all = ["fastapi>=0.110", "uvicorn>=0.29", "surrealdb>=2.0", "boto3>=1.34"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.3"]
 
 [project.scripts]
-agent-loop = "agent_loop.cli:main"
+agent-loop = "src.cli:main"
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
 
-[tool.pytest.ini_options]
-asyncio_mode = "auto"
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
