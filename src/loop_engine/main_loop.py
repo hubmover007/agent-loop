@@ -31,6 +31,7 @@ class MainLoop:
         # Sub-systems
         from ..tools.base import ToolRegistry
         self.tool_registry = ToolRegistry()
+        self.tool_registry.register_defaults()
         self.tool_loop = ToolLoop(self.tool_registry, self.config)
         self.graph_router = GraphRouter(memory)  # M-FLOW graph routing
         self.agent_loop = AgentLoop(self.tool_loop, llm, self.config)
