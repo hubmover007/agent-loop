@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime
 
 from . import LoopConfig, LoopContext, AgentLoop, ToolLoop, LLMProvider
+from .deep_reason import DeepReasonLoop, DeepReasonConfig
 from ..core import LoopPhase, TaskStatus, ToolResult, DiscardRecord
 from ..memory import MemoryPool
 from ..memory.graph_route import GraphRouter
@@ -34,6 +35,10 @@ class MainLoop:
         self.tool_loop = ToolLoop(self.tool_registry, self.config)
         self.graph_router = GraphRouter(memory)  # M-FLOW graph routing
         self.agent_loop = AgentLoop(self.tool_loop, llm, self.config)
+        self.deep_reason = DeepReasonLoop(llm, DeepReasonConfig(
+            max_iterations=self.config.max_reason_loops,
+            confidence_threshold=self.config.reason_confidence_threshold,
+        ))
 
         # Will be set up lazily
         self.task_scheduler: TaskScheduler | None = None
@@ -86,90 +91,39 @@ class MainLoop:
     # ============================================================
 
     async def _reason(self, ctx: LoopContext) -> None:
-        """Deep reasoning loop with ACT-style adaptive depth.
+        """Deep reasoning: RDT-style loop via DeepReasonLoop.
 
         Hybrid mode:
-          - Internal: continuous latent reasoning (model's native thinking)
-          - External: explicit multi-turn refinement loop
+          - Internal: model's native latent reasoning (thinking=true)
+          - External: iterative refinement with ACT adaptive depth
         """
         ctx.current_phase = LoopPhase.REASON
 
-        # Build reasoning prompt with retrieved context
+        # Build context from retrieved memories
         context_text = ""
-        for rc in ctx.retrieved_context[:3]:  # Top 3 most relevant
-            context_text += f"\n[Relevant Memory: {rc['title']}]\n{rc['summary']}\n"
+        for rc in ctx.retrieved_context[:3]:
+            context_text += f"\n[Relevant: {rc['title']}]\n{rc['summary']}\n"
 
-        base_prompt = f"""You are a deep reasoning assistant. Analyze the user's request systematically.
+        try:
+            state = await self.deep_reason.reason(
+                query=ctx.user_input,
+                context=context_text,
+            )
 
-User: {ctx.user_input}
+            ctx.reason_iterations = state.iteration
+            ctx.reason_confidence = state.confidence
+            ctx.reason_output = state.current_thought
+            ctx.thought_chain = [state.current_thought]
 
-Relevant Context:{context_text}
+            logger.info(
+                "MainLoop[%s]: REASON completed (iter=%d, conf=%.2f, insights=%d)",
+                ctx.session_id, state.iteration, state.confidence, len(state.insights)
+            )
 
-Think step by step. What is the user really asking? What approach would work best?"""
-
-        # External reasoning loop
-        messages = [{"role": "user", "content": base_prompt}]
-        for iteration in range(1, self.config.max_reason_loops + 1):
-            ctx.reason_iterations = iteration
-
-            try:
-                response = await self.llm.chat(
-                    messages,
-                    thinking=True,  # Enable model-level latent reasoning
-                )
-            except Exception as e:
-                logger.error("LLM call failed in reason loop: %s", e)
-                ctx.errors.append(f"Reasoning error: {e}")
-                ctx.reason_output = ctx.user_input
-                return
-
-            ctx.thought_chain.append(response.content)
-            messages.append({"role": "assistant", "content": response.content})
-
-            # ACT: check confidence
-            confidence = await self._estimate_confidence(response.content)
-            ctx.reason_confidence = confidence
-
-            if confidence >= self.config.reason_confidence_threshold or iteration == self.config.max_reason_loops:
-                ctx.reason_output = response.content
-                logger.info(
-                    "MainLoop[%s]: REASON completed (iterations=%d, confidence=%.2f)",
-                    ctx.session_id, iteration, confidence
-                )
-                return
-
-            # Refine: ask for reconsideration
-            messages.append({
-                "role": "user",
-                "content": "Re-examine your analysis. Any missing angles? Any alternative approaches? Be concise."
-            })
-
-        ctx.reason_output = messages[-1]["content"] if messages else ctx.user_input
-
-    async def _estimate_confidence(self, text: str) -> float:
-        """Estimate confidence of reasoning output (proxy for ACT halting).
-
-        Uses heuristics: length, structure markers, hedging language.
-        In production, this would use a dedicated confidence model.
-        """
-        score = 0.5  # Base
-
-        # Longer, structured responses suggest more thorough reasoning
-        if len(text) > 200:
-            score += 0.1
-        if len(text) > 500:
-            score += 0.1
-
-        # Structured markers
-        if any(marker in text.lower() for marker in ["step 1", "first,", "1.", "##"]):
-            score += 0.1
-
-        # Hedging (reduces confidence)
-        hedging = ["might", "maybe", "could be", "i'm not sure", "possibly"]
-        hedge_count = sum(1 for h in hedging if h in text.lower())
-        score -= hedge_count * 0.05
-
-        return max(0.1, min(0.95, score))
+        except Exception as e:
+            logger.error("DeepReason failed: %s, falling back to simple reasoning", e)
+            ctx.reason_output = ctx.user_input
+            ctx.errors.append(f"Reasoning degraded: {e}")
 
     # ============================================================
     # 4. DECOMPOSE
