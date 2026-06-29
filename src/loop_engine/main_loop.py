@@ -15,7 +15,8 @@ from .deep_reason import DeepReasonLoop, DeepReasonConfig
 from ..core import LoopPhase, TaskStatus, ToolResult, DiscardRecord
 from ..memory import MemoryPool
 from ..memory.graph_route import GraphRouter
-from ..task_manager import TaskManagerAgent
+from ..system_agents import TaskAgent, AgentManagerAgent, TaskRegistry
+from ..memory.unified_retrieval import UnifiedRetriever, MemoryContext
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +41,18 @@ class MainLoop:
             confidence_threshold=self.config.reason_confidence_threshold,
         ))
 
-        # TaskManager Agent (central orchestrator for task lifecycle)
-        self.task_manager: TaskManagerAgent | None = None
+        # Unified Memory Retriever: M-FLOW graph + Mythos deep reasoning
+        self.retriever = UnifiedRetriever(
+            memory_pool=memory,
+            graph_router=self.graph_router,
+            deep_reason=self.deep_reason,
+            llm=llm,
+        )
+
+        # System Agents: TaskAgent (manages tasks) + AgentManagerAgent (manages agents)
+        self.task_agent: TaskAgent | None = None
+        self.agent_manager: AgentManagerAgent | None = None
+        self.task_registry: TaskRegistry | None = None
 
     # ============================================================
     # 1. INPUT
@@ -61,27 +72,42 @@ class MainLoop:
     # ============================================================
 
     async def _retrieve(self, ctx: LoopContext) -> None:
-        """Retrieve relevant context from Memory Pool using graph-routed search."""
+        """Retrieve unified memory context: M-FLOW graph + Mythos deep recall.
+
+        This is the systemic integration point:
+          1. GraphRouter queries explicit knowledge graph (M-FLOW)
+          2. Results feed into DeepReason for implicit recall (Mythos)
+          3. Unified MemoryContext returned with both layers
+        """
         ctx.current_phase = LoopPhase.RETRIEVE
 
         try:
-            # Use M-FLOW style graph routing
-            results = await self.graph_router.retrieve(ctx.user_input, top_k=5)
+            # Unified retrieval: explicit graph + implicit deep reasoning
+            mem_ctx = await self.retriever.retrieve(
+                query=ctx.user_input,
+                max_hops=3,
+                deep_reason_iterations=3,
+            )
 
+            # Store unified context for REASON phase
+            ctx.memory_context = mem_ctx
             ctx.retrieved_context = [
                 {
-                    "episode_id": r.episode_id,
-                    "title": r.episode_data.get("title", ""),
-                    "summary": r.episode_data.get("summary", ""),
-                    "score": r.score,
-                    "hops": r.path.hops,
+                    "title": item.get("title", ""),
+                    "summary": item.get("summary", ""),
+                    "layer": item.get("layer", ""),
                 }
-                for r in results
+                for item in mem_ctx.explicit
             ]
-            logger.info("MainLoop[%s]: RETRIEVE found %d episodes", ctx.session_id, len(results))
+
+            logger.info(
+                "MainLoop[%s]: RETRIVE graph=%d items, reason_iter=%d conf=%.2f",
+                ctx.session_id, len(mem_ctx.explicit),
+                mem_ctx.reason_iterations, mem_ctx.confidence
+            )
 
         except Exception as e:
-            logger.warning("Graph route retrieval failed: %s, falling back to keyword search", e)
+            logger.warning("Unified retrieval failed: %s", e)
             ctx.retrieved_context = []
             ctx.errors.append(f"Retrieval degraded: {e}")
 
@@ -92,16 +118,27 @@ class MainLoop:
     async def _reason(self, ctx: LoopContext) -> None:
         """Deep reasoning: RDT-style loop via DeepReasonLoop.
 
-        Hybrid mode:
+        Hybrid mode (C: explicit loop + implicit latent):
           - Internal: model's native latent reasoning (thinking=true)
           - External: iterative refinement with ACT adaptive depth
+
+        Memory integration:
+          - Uses unified MemoryContext from _retrieve() (M-FLOW + Mythos)
+          - Graph facts provide anchors for reasoning
+          - DeepReason activates parametric knowledge
         """
         ctx.current_phase = LoopPhase.REASON
 
-        # Build context from retrieved memories
-        context_text = ""
-        for rc in ctx.retrieved_context[:3]:
-            context_text += f"\n[Relevant: {rc['title']}]\n{rc['summary']}\n"
+        # Use unified memory context (explicit graph + implicit recall)
+        mem_ctx = getattr(ctx, 'memory_context', None)
+        if mem_ctx and mem_ctx.explicit:
+            context_text = mem_ctx.to_prompt()
+        else:
+            # Fallback: build from retrieved_context
+            context_text = "\n".join(
+                f"[{rc.get('layer', '?')}] {rc.get('title', '')}: {rc.get('summary', '')}"
+                for rc in ctx.retrieved_context[:3]
+            )
 
         try:
             state = await self.deep_reason.reason(
@@ -129,19 +166,26 @@ class MainLoop:
     # ============================================================
 
     async def _decompose(self, ctx: LoopContext) -> None:
-        """TaskManager Agent decomposes reasoning into subtasks."""
+        """TaskAgent decomposes reasoning into subtasks."""
         ctx.current_phase = LoopPhase.DECOMPOSE
 
-        if not self.task_manager:
-            self.task_manager = TaskManagerAgent(
-                memory=self.memory,
+        if not self.task_registry:
+            self.task_registry = TaskRegistry()
+        if not self.task_agent:
+            self.task_agent = TaskAgent(
                 llm=self.llm,
+                registry=self.task_registry,
+            )
+        if not self.agent_manager:
+            self.agent_manager = AgentManagerAgent(
+                memory=self.memory,
                 agent_loop=self.agent_loop,
                 config=self.config,
+                registry=self.task_registry,
             )
 
-        # TaskManager uses LLM to decompose + register tasks
-        tasks = await self.task_manager.decompose(
+        # TaskAgent uses LLM to decompose + register tasks
+        tasks = await self.task_agent.decompose(
             reasoning_output=ctx.reason_output,
             original_input=ctx.user_input,
         )
@@ -154,55 +198,63 @@ class MainLoop:
     # ============================================================
 
     async def _dispatch(self, ctx: LoopContext) -> None:
-        """TaskManager Agent dispatches ready tasks to worker agents.
+        """AgentManagerAgent assigns ready tasks to worker agents.
 
-        The TaskManager handles:
-          - Dependency-aware scheduling
-          - Worker agent routing (MoE)
-          - Async execution launch
+        TaskAgent provides ready tasks (deps satisfied).
+        AgentManagerAgent creates/assigns workers and launches execution.
         """
         ctx.current_phase = LoopPhase.DISPATCH
 
-        if not self.task_manager:
-            ctx.errors.append("TaskManager not initialized")
+        if not self.task_agent or not self.agent_manager:
+            ctx.errors.append("System agents not initialized")
             return
 
-        dispatched = await self.task_manager.dispatch_ready()
+        # TaskAgent provides ready tasks
+        ready = self.task_agent.get_ready_tasks()
+
+        # AgentManagerAgent assigns each to a worker
+        dispatched = 0
+        for task in ready:
+            if await self.agent_manager.assign(task):
+                dispatched += 1
+
         logger.info("MainLoop[%s]: DISPATCH → %d workers launched",
-                    ctx.session_id, len(dispatched))
+                    ctx.session_id, dispatched)
 
     # ============================================================
     # 6. COLLECT
     # ============================================================
 
     async def _collect(self, ctx: LoopContext) -> None:
-        """TaskManager Agent collects results from all worker agents.
+        """AgentManagerAgent collects results from all worker agents.
 
         Waits for all in-flight tasks, gathers results.
-        Failed tasks may trigger re-planning by the TaskManager.
+        Failed tasks may trigger re-planning by TaskAgent.
         """
         ctx.current_phase = LoopPhase.COLLECT
 
-        if not self.task_manager:
-            ctx.errors.append("TaskManager not initialized")
+        if not self.agent_manager or not self.task_agent:
+            ctx.errors.append("System agents not initialized")
             return
 
-        # Wait for all tasks to complete
-        results = await self.task_manager.collect_all(timeout=300.0)
+        # AgentManagerAgent waits for all workers to finish
+        results = await self.agent_manager.collect_all(timeout=300.0)
 
         for task_id, result in results.items():
             ctx.agent_results.append(result)
 
-        # Check for failed tasks — attempt re-planning
-        for task in self.task_manager.registry.all_tasks():
+        # Check for failed tasks — TaskAgent can re-plan
+        for task in self.task_registry.all_tasks():
             if task.status == TaskStatus.FAILED:
                 ctx.discarded_results.append(task.task_id)
                 ctx.errors.append(f"Task {task.task_id} failed: {task.error}")
 
-                # TaskManager can re-plan failed tasks
-                # new_tasks = await self.task_manager.replan(task)
+                # TaskAgent re-plans failed tasks
+                # new_tasks = await self.task_agent.replan(task)
                 # if new_tasks:
-                #     await self.task_manager.dispatch_ready()
+                #     for nt in new_tasks:
+                #         if await self.agent_manager.assign(nt):
+                #             pass
 
         logger.info(
             "MainLoop[%s]: COLLECT → %d results, %d failed",
