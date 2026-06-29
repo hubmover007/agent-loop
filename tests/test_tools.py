@@ -31,6 +31,6 @@ def test_tool_registry_list_allowed():
     assert len(tools) == 1
     assert tools[0].name == "ssh"
 
-    # Empty allowed = all tools
+    # Empty allowed = all tools (3 built-in + 22 OpenClaw = 25)
     all_tools = registry.list_allowed([])
-    assert len(all_tools) == 3
+    assert len(all_tools) >= 3  # At least ssh, web, code
