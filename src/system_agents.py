@@ -48,6 +48,7 @@ from .core import (
 from .agent import Agent, AgentPool, AgentEvaluator
 from .loop_engine import LLMProvider, LLMResponse, LoopConfig, AgentLoop
 from .task import BranchSpace
+from .external_agents import ExternalAgentBridge, KNOWN_AGENTS
 
 logger = logging.getLogger(__name__)
 
@@ -330,31 +331,79 @@ class AgentManagerAgent:
     role = AgentRole.MANAGER
 
     def __init__(self, memory: Any, agent_loop: AgentLoop,
-                 config: LoopConfig, registry: TaskRegistry):
+                 config: LoopConfig, registry: TaskRegistry,
+                 external_bridge: ExternalAgentBridge | None = None):
         self.memory = memory
         self.agent_loop = agent_loop
         self.config = config
         self.registry = registry
 
-        # Agent pool
+        # Internal agent pool
         self.pool = AgentPool(max_concurrent=config.max_agent_concurrent)
         self.evaluator = AgentEvaluator(
             accept_threshold=config.accept_threshold,
             weights=config.evaluation_weights,
         )
 
+        # External agent bridge (Codex, Claude Code, Gemini, etc.)
+        self.external_bridge = external_bridge or ExternalAgentBridge()
+
         # In-flight tracking: task_id → (agent, asyncio.Task)
         self._inflight: dict[str, tuple[Agent, asyncio.Task]] = {}
 
-    async def assign(self, task: ManagedTask) -> bool:
-        """Assign a task to a worker agent.
+    async def assign(self, task: ManagedTask,
+                     prefer_external: bool = False) -> bool:
+        """Assign a task to a worker agent (internal or external).
 
-        Returns True if successfully assigned, False if no agent available.
+        Decision logic:
+          1. If task.required_tools contains external agent name → dispatch externally
+          2. If prefer_external=True → try external first, fallback to internal
+          3. Otherwise → use internal Worker Agent
+
+        Args:
+            task: The task to assign
+            prefer_external: Prefer external agents (Codex/Claude) when available
+
+        Returns True if successfully assigned.
         """
         if len(self._inflight) >= self.config.max_agent_concurrent:
             return False
 
-        # Find or create worker agent
+        # Check if task should go to an external agent
+        external_agent = self._should_use_external(task, prefer_external)
+        if external_agent:
+            return await self._assign_external(task, external_agent)
+
+        # Use internal worker agent
+        return await self._assign_internal(task)
+
+    def _should_use_external(self, task: ManagedTask,
+                             prefer_external: bool) -> str | None:
+        """Determine if a task should be dispatched to an external agent.
+
+        Returns external agent_type if external dispatch is recommended, None otherwise.
+        """
+        # Check if required_tools explicitly mentions an external agent
+        for tool in task.required_tools:
+            if tool in KNOWN_AGENTS and self.external_bridge.is_available(tool):
+                return tool
+
+        # If prefer_external, recommend best agent based on task scope
+        if prefer_external:
+            # Simple heuristic: coding tasks go to external coding agents
+            scope_lower = task.scope.lower()
+            if any(kw in scope_lower for kw in ["code", "debug", "refactor",
+                                                 "implement", "fix", "test"]):
+                recommended = self.external_bridge.recommend_agent(
+                    task.scope, required_capabilities=["code"]
+                )
+                if recommended:
+                    return recommended
+
+        return None
+
+    async def _assign_internal(self, task: ManagedTask) -> bool:
+        """Assign task to an internal worker agent."""
         agent = await self._acquire_worker(task)
         if not agent:
             return False
@@ -363,11 +412,32 @@ class AgentManagerAgent:
         task.assigned_agent_id = agent.agent_id
         task.started_at = datetime.utcnow()
 
-        # Launch async execution
         asyncio_task = asyncio.create_task(self._execute(task, agent))
         self._inflight[task.task_id] = (agent, asyncio_task)
 
-        logger.info("AgentManager: assigned %s → %s", task.task_id, agent.agent_id)
+        logger.info("AgentManager: assigned %s → internal %s",
+                    task.task_id, agent.agent_id)
+        return True
+
+    async def _assign_external(self, task: ManagedTask,
+                               agent_type: str) -> bool:
+        """Assign task to an external agent (Codex, Claude Code, etc.).
+
+        Uses ExternalAgentBridge to dispatch via ACP or CLI.
+        """
+        task.status = TaskStatus.RUNNING
+        task.assigned_agent_id = f"external:{agent_type}:{task.task_id}"
+        task.started_at = datetime.utcnow()
+
+        asyncio_task = asyncio.create_task(self._execute_external(task, agent_type))
+        # Store with a placeholder Agent for compatibility
+        placeholder = Agent(agent_id=task.assigned_agent_id)
+        placeholder.role = AgentRole.EXPERT
+        placeholder.expertise = [agent_type]
+        self._inflight[task.task_id] = (placeholder, asyncio_task)
+
+        logger.info("AgentManager: assigned %s → external %s",
+                    task.task_id, agent_type)
         return True
 
     async def _acquire_worker(self, task: ManagedTask) -> Agent | None:
@@ -476,10 +546,88 @@ class AgentManagerAgent:
             except Exception as e:
                 logger.warning("AgentManager: discard pool write failed: %s", e)
 
-        # Destroy the agent
-        await self.pool.destroy(agent.agent_id)
+        # Destroy the agent (only if internal)
+        if not agent.agent_id.startswith("external:"):
+            await self.pool.destroy(agent.agent_id)
         logger.warning("AgentManager: agent %s destroyed (task %s failed: %s)",
                       agent.agent_id, task.task_id, reason)
+
+    async def _execute_external(self, task: ManagedTask, agent_type: str) -> None:
+        """Execute a task via an external agent (Codex, Claude Code, etc.).
+
+        Uses ExternalAgentBridge to dispatch and collect results.
+        External agents have their own evaluation — we trust their output
+        but still run through quality evaluation.
+        """
+        try:
+            result_data = await self.external_bridge.dispatch(
+                agent_type=agent_type,
+                task=task.scope,
+                workspace=task.branch_id,
+                timeout=300,
+            )
+
+            # Build TaskResult from external output
+            external_result = TaskResult(
+                task_id=task.task_id,
+                agent_id=task.assigned_agent_id or "",
+                status=TaskStatus.DONE if result_data.get("status") == "done"
+                       else TaskStatus.FAILED,
+                summary=result_data.get("output", "")[:500],
+                artifacts={"full_output": result_data.get("output", ""),
+                          "dispatch_method": result_data.get("dispatch_method", "")},
+                steps=[],
+            )
+
+            if external_result.status == TaskStatus.DONE:
+                # Evaluate quality (simplified for external agents)
+                eval_result = self.evaluator.evaluate(external_result, task.scope)
+                task.evaluation = eval_result
+
+                if eval_result.action == "accept":
+                    task.status = TaskStatus.DONE
+                    task.result = external_result
+                    task.completed_at = datetime.utcnow()
+                    logger.info("AgentManager: external %s → %s DONE",
+                               agent_type, task.task_id)
+                else:
+                    # External result not good enough — retry or fail
+                    if task.retry_count < task.max_retries:
+                        task.retry_count += 1
+                        task.status = TaskStatus.PENDING
+                        task.assigned_agent_id = None
+                        logger.info("AgentManager: external %s → %s retry",
+                                   agent_type, task.task_id)
+                    else:
+                        task.status = TaskStatus.FAILED
+                        task.error = eval_result.reason
+                        task.completed_at = datetime.utcnow()
+            else:
+                # External agent failed
+                if task.retry_count < task.max_retries:
+                    task.retry_count += 1
+                    task.status = TaskStatus.PENDING
+                    task.assigned_agent_id = None
+                else:
+                    task.status = TaskStatus.FAILED
+                    task.error = result_data.get("error", "External agent failed")
+                    task.completed_at = datetime.utcnow()
+
+                    if self.memory:
+                        await self.memory.discard_result(
+                            agent_id=task.assigned_agent_id or agent_type,
+                            task_id=task.task_id,
+                            reason=task.error or "External agent failed",
+                        )
+
+        except Exception as e:
+            task.status = TaskStatus.FAILED
+            task.error = f"External agent exception: {e}"
+            task.completed_at = datetime.utcnow()
+            logger.error("AgentManager: external %s exception: %s",
+                        agent_type, e)
+        finally:
+            self._inflight.pop(task.task_id, None)
 
     async def collect_all(self, timeout: float = 300.0) -> dict[str, TaskResult]:
         """Wait for all in-flight tasks to complete."""

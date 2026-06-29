@@ -177,11 +177,13 @@ class MainLoop:
                 registry=self.task_registry,
             )
         if not self.agent_manager:
+            from ..external_agents import ExternalAgentBridge
             self.agent_manager = AgentManagerAgent(
                 memory=self.memory,
                 agent_loop=self.agent_loop,
                 config=self.config,
                 registry=self.task_registry,
+                external_bridge=ExternalAgentBridge(),
             )
 
         # TaskAgent uses LLM to decompose + register tasks
