@@ -37,6 +37,7 @@ from typing import Any
 from .core import TaskStatus, AgentStatus, TaskResult, EvaluationResult, StepLog, AgentRole
 from .agent import AgentPool, AgentRouter, AgentEvaluator, Agent
 from .loop_engine import LLMProvider, LLMResponse, LoopConfig, AgentLoop
+from .task import BranchSpace
 
 logger = logging.getLogger(__name__)
 
@@ -380,12 +381,22 @@ Respond as JSON:
         """Execute a single task with a worker agent.
 
         Full lifecycle:
-          1. Agent runs the task via AgentLoop
-          2. Evaluate result quality
-          3. Accept → mark done
-          4. Discard → retry or fail
-          5. Exception → fail + destroy agent
+          1. Create BranchSpace (isolated workspace for this task)
+          2. Agent runs the task via AgentLoop
+          3. Evaluate result quality
+          4. Accept → commit branch to mainline → mark done
+          5. Discard → retry or fail
+          6. Exception → fail + destroy agent
         """
+        # Create branch space for this task execution
+        branch = BranchSpace(task_id=task.task_id, agent_id=agent.agent_id)
+        try:
+            await branch.init(self.memory)
+            task.branch_id = task.task_id  # Link task to its branch
+            branch.log("task_started", {"scope": task.scope, "agent": agent.agent_id})
+        except Exception as e:
+            logger.warning("TaskManager: branch init failed for %s: %s", task.task_id, e)
+
         try:
             context = {
                 "task_id": task.task_id,
@@ -393,6 +404,7 @@ Respond as JSON:
                 "priority": task.priority,
                 "required_tools": task.required_tools,
                 "branch_id": task.branch_id,
+                "branch_dir": str(branch.base_dir),
             }
 
             result = await agent.run(
@@ -402,6 +414,8 @@ Respond as JSON:
                 allowed_tools=task.required_tools,
             )
 
+            branch.log("task_completed", {"summary": result.summary})
+
             # Evaluate quality
             eval_result = self.evaluator.evaluate(result, task.scope)
             task.evaluation = eval_result
@@ -410,6 +424,9 @@ Respond as JSON:
                 task.status = TaskStatus.DONE
                 task.result = result
                 task.completed_at = datetime.utcnow()
+
+                # Commit branch to mainline memory
+                await branch.commit(self.memory)
 
                 if self.memory:
                     await self.memory.update_task_status(task.task_id, "done", {
@@ -421,6 +438,7 @@ Respond as JSON:
                            task.task_id, eval_result.overall)
             else:
                 # Discard — retry if possible
+                branch.log("task_discarded", {"reason": eval_result.reason})
                 if task.retry_count < task.max_retries:
                     task.retry_count += 1
                     task.status = TaskStatus.PENDING
@@ -433,11 +451,15 @@ Respond as JSON:
                     return
 
         except Exception as e:
+            branch.log("task_exception", {"error": str(e)})
             await self._fail_task(task, f"Agent exception: {e}")
             await self.worker_pool.destroy(agent.agent_id)
             logger.error("TaskManager: task %s exception: %s", task.task_id, e)
 
         finally:
+            # Clean up branch space
+            await branch.cleanup()
+
             # Release agent back to pool (if not destroyed)
             if agent.agent_id in self.worker_pool._agents:
                 await self.worker_pool.release(agent.agent_id)

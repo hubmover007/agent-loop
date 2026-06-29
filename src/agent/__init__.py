@@ -245,11 +245,19 @@ class AgentEvaluator:
 
 
 # ============================================================
-# AgentOrchestrator (Facade)
+# AgentOrchestrator (DEPRECATED — use TaskManagerAgent instead)
 # ============================================================
 
 class AgentOrchestrator:
-    """Top-level orchestrator: routes tasks → agents → evaluates → collects."""
+    """DEPRECATED: Use TaskManagerAgent instead.
+
+    This class is kept for backward compatibility but should not be used.
+    TaskManagerAgent provides the same functionality with better integration:
+    - LLM-driven decomposition
+    - Dependency-aware scheduling
+    - BranchSpace integration
+    - Re-planning capability
+    """
 
     def __init__(self, memory: Any, agent_loop: Any, config: Any):
         self.memory = memory
