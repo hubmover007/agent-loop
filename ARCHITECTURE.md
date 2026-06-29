@@ -505,90 +505,118 @@ class DiscardPool:
 
 ## 四、Task 管理系统
 
-### 4.1 TaskTree（任务树）
+### 4.0 架构变更：TaskManagerAgent（中心编排 Agent）
+
+> **关键设计**: Task 管理由一个专门的 **TaskManagerAgent** 负责，
+> 它本身是一个 LLM-driven Agent，拥有完整的任务生命周期管理能力。
 
 ```
-TaskTree:
-  RootTask(id=T0, parent=None)
-    ├── SubTask(id=T1, parent=T0, scope="SSH诊断")
-    │   ├── SubSubTask(id=T1a, parent=T1)
-    │   └── SubSubTask(id=T1b, parent=T1)
-    ├── SubTask(id=T2, parent=T0, scope="日志分析")
-    └── SubTask(id=T3, parent=T0, scope="修复操作")
+MainLoop (用户输入 → 深度推理)
+  → TaskManagerAgent (拆分 → 注册 → 派遣 → 跟踪 → 收集)
+    → Worker Agent 1 (执行子任务, BranchSpace 隔离)
+    → Worker Agent 2 (执行子任务, BranchSpace 隔离)
+    → ...
+  → MainLoop 合成最终输出
 ```
 
-### 4.2 Task 数据结构
+**TaskManagerAgent 核心能力（参照 AgentOrchestra / AutoGen / CrewAI）**:
+
+| 能力 | 说明 | 灵感来源 |
+|------|------|----------|
+| LLM 拆分 | 用 LLM 分析推理输出，生成子任务+依赖图 | AgentOrchestra Planning Agent |
+| 任务注册 | 所有任务持久化到 TaskRegistry + MemoryPool | AutoGen Orchestrator |
+| 依赖调度 | 只派遣依赖已完成的任务 | LangGraph Supervisor |
+| Worker 分配 | MoE 路由匹配最佳 Worker Agent | AutoGen Orchestrator-Worker |
+| 质量评估 | 四维评分，接受/丢弃/重试 | CrewAI Manager |
+| 分支空间 | 每个任务独立 BranchSpace，完成后提交主线 | Git Branching |
+| 自适应重规划 | 失败任务用 LLM 重新规划替代方案 | AgentOrchestra Adaptive |
+
+### 4.1 TaskRegistry（任务注册表）
+
+```python
+class TaskRegistry:
+    """所有任务的单一来源，持久化到 MemoryPool"""
+    
+    async def register(scope, priority, dependencies, ...) -> ManagedTask
+    def get(task_id) -> ManagedTask | None
+    def get_ready() -> list[ManagedTask]       # 依赖已完成的任务
+    def all_tasks() -> list[ManagedTask]
+    def stats() -> dict                         # pending/running/done/failed
+```
+
+### 4.2 ManagedTask（任务数据结构）
 
 ```python
 @dataclass
-class Task:
-    id: str
+class ManagedTask:
+    task_id: str
     parent_id: str | None
     scope: str                    # 任务范围描述
-    context: dict                 # 从 Memory Pool 检索的上下文
-    required_tools: list[str]     # 需要的工具白名单
-    deadline: datetime | None     # 截止时间
-    status: TaskStatus            # pending → assigned → running → done/failed/discarded
-    priority: int                 # 优先级 1-5
+    priority: int                 # 1-5
     dependencies: list[str]       # 依赖的任务 ID 列表
-
-    # 分支空间
-    branch_space: BranchSpace     # Agent 专属工作区
-
-    # 结果
-    result: TaskResult | None     # Agent 提交的结果
-    assigned_agent: str | None    # 分配的 Agent ID
+    required_tools: list[str]     # 需要的工具白名单
+    
+    # 生命周期
+    status: TaskStatus            # pending → running → done/failed/cancelled
+    assigned_agent_id: str | None
+    result: TaskResult | None
+    evaluation: EvaluationResult | None
+    
+    # 重试 + 分支
+    retry_count: int
+    max_retries: int
+    branch_id: str | None         # BranchSpace 标识
+    error: str | None
 ```
 
-### 4.3 TaskScheduler
+### 4.3 TaskManagerAgent 方法
 
 ```python
-class TaskScheduler:
-    """任务调度器: 维护全局 TaskTree，协调 Agent 执行"""
-
-    async def decompose(self, root_task: Task) -> TaskTree:
-        """将复杂任务分解为子任务树"""
-        # 使用 LLM 分析任务 → 生成子任务列表
-        # 返回结构化 TaskTree
-
-    async def dispatch(self, task_tree: TaskTree):
-        """按依赖关系和优先级调度任务"""
-        # 拓扑排序 → 无依赖任务先发
-        # 有依赖任务等待前置完成
-        # 并行任务并发派遣
-
-    async def merge(self, task: Task, result: TaskResult):
-        """合并子任务结果到父任务"""
-        # 所有子任务完成 → 父任务标记完成
-        # 汇总结果到 Branch Space
-
-    async def cancel(self, task_id: str):
-        """取消任务 + 销毁相关 Agent"""
-        # 递归取消子任务
-        # 通知 Agent 停止
+class TaskManagerAgent:
+    """中心编排 Agent，管理完整任务生命周期"""
+    
+    async def decompose(reasoning, original) -> list[ManagedTask]
+        # LLM 拆分 → 注册 TaskRegistry → 解析依赖边
+    
+    async def dispatch_ready() -> list[str]
+        # 获取 ready 任务 → MoE 路由匹配 Worker → 异步执行
+    
+    async def _execute_worker(task, agent) -> None
+        # BranchSpace init → agent.run → evaluate → accept/retry/fail → commit
+    
+    async def collect_all(timeout) -> dict[str, TaskResult]
+        # 等待所有 in-flight → 自动派遣新 ready → 收集结果
+    
+    async def replan(failed_task) -> list[ManagedTask] | None
+        # LLM 重新规划失败任务 → 生成替代子任务
+    
+    async def cancel(task_id) / cancel_all()
+        # 取消任务 + 销毁关联 Agent
 ```
 
 ### 4.4 BranchSpace（Agent 分支空间）
 
 ```python
 class BranchSpace:
-    """每个 Agent 的独立工作空间"""
+    """每个任务执行的隔离工作空间"""
     task_id: str
     agent_id: str
-    workspace: Path               # 临时文件目录
+    base_dir: Path               # 临时文件目录
     memory_snapshot: dict         # 任务开始时的记忆快照(只读)
-    execution_log: list[StepLog]  # 执行步骤日志
+    execution_log: list           # 执行步骤日志
     artifacts: dict               # 产出物(代码、报告等)
 
-    async def init(self):
-        """初始化分支空间: 创建临时目录 + 拉取记忆快照"""
+    async def init(memory)
+        # 创建临时目录 + 拉取记忆快照
 
-    async def commit(self):
-        """提交变更: 将产出物合并到主任务"""
+    async def commit(memory)
+        # 接受结果时: 将产出物写入主记忆 episode
 
-    async def cleanup(self):
-        """清理: 删除临时文件"""
+    async def cleanup()
+        # 清理: 删除临时文件
 ```
+
+**流程**: `init()` → agent 执行 → 评估通过则 `commit()` → `cleanup()`
 
 ---
 
