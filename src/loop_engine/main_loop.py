@@ -15,8 +15,7 @@ from .deep_reason import DeepReasonLoop, DeepReasonConfig
 from ..core import LoopPhase, TaskStatus, ToolResult, DiscardRecord
 from ..memory import MemoryPool
 from ..memory.graph_route import GraphRouter
-from ..agent import AgentOrchestrator
-from ..task import TaskTree, TaskScheduler
+from ..pipeline import TaskPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +39,8 @@ class MainLoop:
             confidence_threshold=self.config.reason_confidence_threshold,
         ))
 
-        # Will be set up lazily
-        self.task_scheduler: TaskScheduler | None = None
-        self.agent_orchestrator: AgentOrchestrator | None = None
+        # Unified task pipeline (replaces fragmented TaskScheduler + AgentOrchestrator)
+        self.pipeline: TaskPipeline | None = None
 
     # ============================================================
     # 1. INPUT
@@ -130,112 +128,81 @@ class MainLoop:
     # ============================================================
 
     async def _decompose(self, ctx: LoopContext) -> None:
-        """Decompose reasoning output into TaskTree."""
+        """Decompose reasoning output into tasks via unified pipeline."""
         ctx.current_phase = LoopPhase.DECOMPOSE
 
-        try:
-            decompose_prompt = f"""Based on the analysis below, decompose the task into subtasks.
-
-Analysis: {ctx.reason_output}
-
-Output structured subtasks. Each subtask should be a concrete, actionable unit.
-Respond as JSON array:
-[
-  {{
-    "scope": "specific subtask description",
-    "priority": 1-5 (5=highest),
-    "required_tools": ["tool1", "tool2"],
-    "dependencies": [] or ["other_subtask_id"]
-  }}
-]
-
-If the task is already simple, return a single subtask array."""
-
-            response = await self.llm.chat([{"role": "user", "content": decompose_prompt}])
-            import json
-
-            # Extract JSON from response
-            content = response.content
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0]
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0]
-
-            subtasks = json.loads(content.strip())
-            if not isinstance(subtasks, list):
-                subtasks = [subtasks]
-
-            # Register tasks in memory
-            for i, st in enumerate(subtasks):
-                task_id = f"task:{uuid.uuid4().hex[:12]}"
-                await self.memory.register_task(
-                    task_id=task_id,
-                    parent_id=None,
-                    scope=st["scope"],
-                    priority=st.get("priority", 3),
-                )
-                ctx.task_ids.append(task_id)
-
-            logger.info("MainLoop[%s]: DECOMPOSE → %d subtasks", ctx.session_id, len(subtasks))
-
-        except Exception as e:
-            logger.warning("Task decomposition failed: %s, using single task", e)
-            task_id = f"task:{uuid.uuid4().hex[:12]}"
-            await self.memory.register_task(
-                task_id=task_id, parent_id=None, scope=ctx.user_input
+        if not self.pipeline:
+            self.pipeline = TaskPipeline(
+                memory=self.memory,
+                llm=self.llm,
+                agent_loop=self.agent_loop,
+                config=self.config,
             )
-            ctx.task_ids.append(task_id)
+
+        # Unified: LLM decompose → TaskTree build → dependency resolution
+        tasks = await self.pipeline.decompose(
+            reasoning_output=ctx.reason_output,
+            original_input=ctx.user_input,
+        )
+
+        ctx.task_ids = [t.task_id for t in tasks]
+        logger.info("MainLoop[%s]: DECOMPOSE → %d tasks", ctx.session_id, len(tasks))
 
     # ============================================================
     # 5. DISPATCH
     # ============================================================
 
     async def _dispatch(self, ctx: LoopContext) -> None:
-        """Dispatch tasks to agents via the orchestrator."""
+        """Dispatch ready tasks to agents via unified pipeline.
+
+        The pipeline handles:
+          - Dependency-aware scheduling (only dispatch tasks whose deps are done)
+          - Agent routing (find best agent or create new)
+          - Async execution (each task runs as asyncio task)
+        """
         ctx.current_phase = LoopPhase.DISPATCH
 
-        if not self.agent_orchestrator:
-            # Lazy init
-            from ..agent import AgentOrchestrator
-            self.agent_orchestrator = AgentOrchestrator(
-                memory=self.memory,
-                agent_loop=self.agent_loop,
-                config=self.config,
-            )
+        if not self.pipeline:
+            ctx.errors.append("Pipeline not initialized")
+            return
 
-        for task_id in ctx.task_ids:
-            task_data = await self.memory._db.select(task_id)
-            if task_data:
-                await self.agent_orchestrator.dispatch(
-                    task_id=task_id,
-                    scope=task_data.get("scope", ""),
-                    priority=task_data.get("priority", 3),
-                )
-
-        logger.info("MainLoop[%s]: DISPATCH → %d agents", ctx.session_id, len(ctx.task_ids))
+        # Dispatch all ready tasks (respecting dependencies)
+        dispatched = await self.pipeline.dispatch_ready()
+        logger.info("MainLoop[%s]: DISPATCH → %d agents launched", ctx.session_id, len(dispatched))
 
     # ============================================================
     # 6. COLLECT
     # ============================================================
 
     async def _collect(self, ctx: LoopContext) -> None:
-        """Collect and evaluate agent results."""
+        """Collect results from all tasks via unified pipeline.
+
+        Waits for all in-flight tasks, then gathers results.
+        Failed tasks are retried by the pipeline automatically.
+        """
         ctx.current_phase = LoopPhase.COLLECT
 
-        if not self.agent_orchestrator:
-            ctx.errors.append("No orchestrator available")
+        if not self.pipeline:
+            ctx.errors.append("Pipeline not initialized")
             return
 
-        for task_id in ctx.task_ids:
-            result = await self.agent_orchestrator.collect(task_id)
-            if result:
-                ctx.agent_results.append(result)
-            else:
-                ctx.discarded_results.append(task_id)
-                ctx.errors.append(f"Task {task_id} had no valid result")
+        # Wait for all tasks to complete
+        results = await self.pipeline.collect_all(timeout=300.0)
+
+        for task_id, result in results.items():
+            ctx.agent_results.append(result)
+
+        # Check for failed tasks
+        for task in self.pipeline.all_tasks():
+            if task.status == TaskStatus.FAILED:
+                ctx.discarded_results.append(task.task_id)
+                ctx.errors.append(f"Task {task.task_id} failed: {task.error}")
+            elif task.status == TaskStatus.DONE and task.task_id not in results:
+                # Done but no result object — still counts as success
+                pass
 
         logger.info(
-            "MainLoop[%s]: COLLECT → %d results, %d discarded",
+            "MainLoop[%s]: COLLECT → %d results, %d failed",
             ctx.session_id, len(ctx.agent_results), len(ctx.discarded_results)
         )
 
