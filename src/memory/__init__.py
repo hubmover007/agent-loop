@@ -31,6 +31,8 @@ class MemoryPool:
 
     All agents read/write through this single pool.
     No copies, no sync - shared access through SurrealDB.
+
+    Falls back to in-memory dict when SurrealDB is not connected.
     """
 
     def __init__(self, url: str = "ws://127.0.0.1:8000", namespace: str = "agent_loop",
@@ -41,6 +43,7 @@ class MemoryPool:
         self._auth = {"user": user, "pass": password}
         self._db: Surreal | None = None
         self._embedding_fn: Any = None  # Set via configure_embedding()
+        self._mem: dict[str, list[dict]] = {}  # in-memory fallback
 
     async def connect(self) -> None:
         """Connect to SurrealDB and initialize schema."""
@@ -102,13 +105,18 @@ class MemoryPool:
                          embedding_text: str | None = None) -> str:
         """Write a Fact (entity or facetpoint) to Layer 0."""
         embedding = await self.embed(embedding_text or name) if self._embedding_fn else None
-        result = await self._db.create("fact", {
+        record = {
             "fact_type": fact_type,
             "name": name,
             "value": value,
             "embedding": embedding or [],
-        })
-        return result["id"]
+        }
+        if self._db:
+            result = await self._db.create("fact", record)
+            return result["id"]
+        else:
+            self._mem.setdefault("fact", []).append(record)
+            return f"fact:{len(self._mem['fact'])}"
 
     async def write_facet(self, name: str, description: str) -> str:
         """Write a Facet to Layer 1."""
@@ -160,12 +168,18 @@ class MemoryPool:
 
     async def get_fact(self, name: str) -> dict | None:
         """Get a Fact by name."""
-        result = await self._db.query(
-            "SELECT * FROM fact WHERE name = $name LIMIT 1",
-            {"name": name}
-        )
-        rows = result if isinstance(result, list) else result.get("result", [])
-        return rows[0] if rows else None
+        if self._db:
+            result = await self._db.query(
+                "SELECT * FROM fact WHERE name = $name LIMIT 1",
+                {"name": name}
+            )
+            rows = result if isinstance(result, list) else result.get("result", [])
+            return rows[0] if rows else None
+        else:
+            for r in self._mem.get("fact", []):
+                if r.get("name") == name:
+                    return r
+            return None
 
     async def get_facet(self, name: str) -> dict | None:
         """Get a Facet by name."""
