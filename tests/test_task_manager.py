@@ -2,7 +2,7 @@
 
 import asyncio
 import pytest
-from src.task_manager import TaskRegistry, ManagedTask
+from src.system_agents import TaskRegistry, ManagedTask
 from src.core import TaskStatus
 
 

@@ -131,7 +131,7 @@ def cmd_status(args):
     try:
         from src.memory import MemoryPool
         from src.loop_engine.main_loop import MainLoop
-        from src.task_manager import TaskManagerAgent
+        from src.system_agents import TaskAgent, AgentManagerAgent, TaskRegistry
         from src.tools.base import ToolRegistry
         from src.tools.ssh import SSHTool
         from src.tools.web import WebTool, CodeTool

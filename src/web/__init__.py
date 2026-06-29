@@ -25,7 +25,7 @@ from ..core import TaskStatus, AgentStatus, LoopPhase
 from ..loop_engine import LLMProvider, LoopConfig
 from ..loop_engine.main_loop import MainLoop, LoopContext
 from ..memory import MemoryPool
-from ..task_manager import TaskManagerAgent
+from ..system_agents import TaskAgent, AgentManagerAgent, TaskRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -126,11 +126,19 @@ def create_app(memory: MemoryPool, llm: LLMProvider,
     @app.get("/api/status")
     async def get_status():
         """Get system status overview."""
-        tm = main_loop.task_manager
-        pipeline_status = tm.status() if tm else {
-            "total": 0, "pending": 0, "running": 0,
-            "done": 0, "failed": 0, "inflight": 0,
-            "agents_active": 0, "agents_idle": 0,
+        ta = main_loop.task_agent
+        am = main_loop.agent_manager
+        reg = main_loop.task_registry
+        tasks = reg.all_tasks() if reg else []
+        pipeline_status = {
+            "total": len(tasks),
+            "pending": sum(1 for t in tasks if t.status.value == "pending"),
+            "running": sum(1 for t in tasks if t.status.value == "running"),
+            "done": sum(1 for t in tasks if t.status.value == "done"),
+            "failed": sum(1 for t in tasks if t.status.value == "failed"),
+            "inflight": len(am._inflight) if am else 0,
+            "agents_active": am.pool.active_count if am and am.pool else 0,
+            "agents_idle": am.pool.idle_count if am and am.pool else 0,
         }
 
         return {
@@ -163,25 +171,23 @@ def create_app(memory: MemoryPool, llm: LLMProvider,
     @app.get("/api/tasks")
     async def list_tasks():
         """List all tasks in the registry."""
-        tm = main_loop.task_manager
-        if not tm:
+        reg = main_loop.task_registry
+        if not reg:
             return {"tasks": []}
-        return {"tasks": [t.to_dict() for t in tm.registry.all_tasks()]}
+        return {"tasks": [t.to_dict() for t in reg.all_tasks()]}
 
     @app.get("/api/tasks/{task_id}")
     async def get_task(task_id: str):
         """Get detailed task information."""
-        tm = main_loop.task_manager
-        if not tm:
-            return JSONResponse({"error": "No task manager"}, status_code=503)
+        reg = main_loop.task_registry
+        if not reg:
+            return JSONResponse({"error": "No task registry"}, status_code=503)
 
-        task = tm.registry.get(task_id)
+        task = reg.get(task_id)
         if not task:
             return JSONResponse({"error": "Task not found"}, status_code=404)
 
-        result = {
-            **task.to_dict(),
-        }
+        result = {**task.to_dict()}
         if task.result:
             result["result"] = {
                 "summary": task.result.summary,
@@ -199,22 +205,21 @@ def create_app(memory: MemoryPool, llm: LLMProvider,
     @app.post("/api/tasks/{task_id}/cancel")
     async def cancel_task(task_id: str):
         """Cancel a running task."""
-        tm = main_loop.task_manager
-        if not tm:
-            return JSONResponse({"error": "No task manager"}, status_code=503)
-
-        await tm.cancel(task_id)
+        am = main_loop.agent_manager
+        if not am:
+            return JSONResponse({"error": "No agent manager"}, status_code=503)
+        await am.cancel(task_id)
         return {"status": "cancelled", "task_id": task_id}
 
     @app.get("/api/agents")
     async def list_agents():
         """List all agents in the pool."""
-        tm = main_loop.task_manager
-        if not tm:
+        am = main_loop.agent_manager
+        if not am or not am.pool:
             return {"agents": []}
 
         agents = []
-        for agent_id, agent in tm.worker_pool.agents.items():
+        for agent_id, agent in am.pool.agents.items():
             agents.append({
                 "agent_id": agent_id,
                 "status": agent.status.value if hasattr(agent.status, 'value') else str(agent.status),
