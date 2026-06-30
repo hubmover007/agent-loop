@@ -132,9 +132,8 @@ class UnifiedRetriever:
             query_embedding = await self._embed(query)
 
             # Graph routing: anchor search → subgraph extraction → cost propagation
-            graph_results = await self.graph_router.route_search(
-                anchor_embedding=query_embedding,
-                max_hops=max_hops,
+            graph_results = await self.graph_router.retrieve(
+                query=query,
             )
 
             context.explicit = graph_results
@@ -222,26 +221,100 @@ class UnifiedRetriever:
         M-FLOW archival: episodic memories are periodically compressed
         into semantic facts (entity-relation triples) for long-term storage.
 
-        Mythos parametric: repeated patterns in episodes can be
-        fine-tuned into model parameters (future work).
+        Process:
+          1. Fetch unconsolidated episodes from MemoryPool
+          2. Use LLM to extract entity-relation triples from episodes
+          3. Write extracted facts back to MemoryPool
+          4. Mark episodes as consolidated
 
         Returns consolidation statistics.
         """
         stats = {"episodes_processed": 0, "facts_created": 0}
 
         try:
-            # Get recent episodes not yet consolidated
-            # This would query SurrealDB for episodes with consolidated=false
-            # For now, this is a placeholder for the consolidation pipeline
-
-            # TODO: Implement actual consolidation:
             # 1. Fetch unconsolidated episodes
-            # 2. Use LLM to extract entity-relation triples
-            # 3. Merge into semantic memory (Fact layer)
+            episodes = await self.memory.get_unconsolidated_episodes(limit=50)
+            if not episodes:
+                logger.info("UnifiedRetriever: no unconsolidated episodes")
+                return stats
+
+            # 2. Extract entity-relation triples via LLM
+            triples = await self._extract_triples(episodes)
+
+            # 3. Write facts back to MemoryPool
+            for triple in triples:
+                try:
+                    await self.memory.write_fact(
+                        fact_type="entity",
+                        name=triple.get("entity", ""),
+                        value={
+                            "relation": triple.get("relation", ""),
+                            "target": triple.get("target", ""),
+                        },
+                        embedding_text=f"{triple.get('entity', '')} {triple.get('relation', '')} {triple.get('target', '')}",
+                    )
+                    stats["facts_created"] += 1
+                except Exception as e:
+                    logger.warning("Consolidate: write_fact failed: %s", e)
+
             # 4. Mark episodes as consolidated
-            pass
+            for ep in episodes:
+                ep_id = ep.get("id", "")
+                if ep_id:
+                    try:
+                        await self.memory.mark_episode_consolidated(ep_id)
+                        stats["episodes_processed"] += 1
+                    except Exception as e:
+                        logger.warning("Consolidate: mark_episode failed: %s", e)
+
+            logger.info(
+                "UnifiedRetriever: consolidated %d episodes → %d facts",
+                stats["episodes_processed"], stats["facts_created"]
+            )
 
         except Exception as e:
             logger.warning("UnifiedRetriever: consolidation failed: %s", e)
 
         return stats
+
+    async def _extract_triples(self, episodes: list[dict]) -> list[dict]:
+        """Use LLM to extract entity-relation triples from episodes.
+
+        Returns a list of {"entity": "...", "relation": "...", "target": "..."}.
+        """
+        if not episodes:
+            return []
+
+        # Build compact episode summaries for the prompt
+        summaries = []
+        for ep in episodes[:20]:  # Limit to avoid huge prompts
+            title = ep.get("title", "")
+            summary = ep.get("summary", ep.get("user_input", ""))
+            output = ep.get("output", ep.get("content", ""))[:200]
+            summaries.append(f"- [{title}]: {summary} | Output: {output}")
+
+        prompt = f"""Extract entity-relation triples from the following episodes.
+An entity-relation triple captures: (subject, predicate, object).
+Output a JSON array:
+
+Episodes:
+{chr(10).join(summaries)}
+
+Output only JSON array of triples:
+[{{"entity": "...", "relation": "...", "target": "..."}}]
+
+Only include meaningful triples. Skip if nothing substantive."""
+
+        try:
+            import json
+            response = await self.llm.chat([{"role": "user", "content": prompt}])
+            content = response.content.strip()
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0]
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0]
+            triples = json.loads(content)
+            return triples if isinstance(triples, list) else []
+        except Exception as e:
+            logger.warning("Extract triples LLM call failed: %s", e)
+            return []

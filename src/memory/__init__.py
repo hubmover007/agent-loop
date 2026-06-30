@@ -129,17 +129,33 @@ class MemoryPool:
         return result["id"]
 
     async def write_episode(self, title: str, summary: str, content: str = "",
-                            tags: list[str] | None = None) -> str:
+                            tags: list[str] | None = None,
+                            user_input: str = "", output: str = "",
+                            task_count: int = 0, session_id: str = "",
+                            consolidated: bool = False) -> str:
         """Write an Episode to Layer 2."""
         embedding = await self.embed(summary) if self._embedding_fn else None
-        result = await self._db.create("episode", {
+        record = {
             "title": title,
             "summary": summary,
             "content": content,
             "embedding": embedding or [],
             "tags": tags or [],
-        })
-        return result["id"]
+            "type": "episode",
+            "user_input": user_input,
+            "output": output,
+            "task_count": task_count,
+            "session_id": session_id,
+            "consolidated": consolidated,
+        }
+        if self._db:
+            result = await self._db.create("episode", record)
+            return result["id"]
+        else:
+            self._mem.setdefault("episode", []).append(record)
+            ep_id = f"episode:{len(self._mem['episode'])}"
+            record["id"] = ep_id
+            return ep_id
 
     async def write_project(self, name: str, description: str) -> str:
         """Write a Project to Layer 3."""
@@ -192,7 +208,73 @@ class MemoryPool:
 
     async def get_episode(self, episode_id: str) -> dict | None:
         """Get an Episode by ID."""
-        return await self._db.select(episode_id)
+        if self._db:
+            return await self._db.select(episode_id)
+        else:
+            for r in self._mem.get("episode", []):
+                if r.get("id") == episode_id:
+                    return r
+            return None
+
+    async def store(self, data: dict) -> str:
+        """Generic store: accepts a dict with 'type' key, routes to appropriate writer.
+
+        Supported types: 'episode', 'fact'.
+        """
+        record_type = data.pop("type", "episode")
+        if record_type == "episode":
+            return await self.write_episode(
+                title=data.pop("title", data.get("user_input", "")[:80]),
+                summary=data.pop("summary", data.get("output", "")),
+                content=data.pop("content", ""),
+                tags=data.pop("tags", None),
+                user_input=data.pop("user_input", ""),
+                output=data.pop("output", ""),
+                task_count=data.pop("task_count", 0),
+                session_id=data.pop("session_id", ""),
+                consolidated=data.pop("consolidated", False),
+            )
+        elif record_type == "fact":
+            return await self.write_fact(
+                fact_type=data.pop("fact_type", "entity"),
+                name=data.pop("name", ""),
+                value=data.pop("value", None),
+                embedding_text=data.pop("embedding_text", None),
+            )
+        else:
+            raise ValueError(f"Unknown record type: {record_type}")
+
+    async def get_unconsolidated_episodes(self, limit: int = 50) -> list[dict]:
+        """Get episodes that haven't been consolidated yet."""
+        if self._db:
+            try:
+                result = await self._db.query(
+                    "SELECT * FROM episode WHERE consolidated = false OR consolidated IS NONE LIMIT $limit",
+                    {"limit": limit}
+                )
+                return result if isinstance(result, list) else result.get("result", [])
+            except Exception as e:
+                logger.warning("Query unconsolidated episodes failed: %s", e)
+                return []
+        else:
+            return [r for r in self._mem.get("episode", [])
+                    if not r.get("consolidated", False)][:limit]
+
+    async def mark_episode_consolidated(self, episode_id: str) -> None:
+        """Mark an episode as consolidated."""
+        if self._db:
+            try:
+                await self._db.query(
+                    "UPDATE episode SET consolidated = true WHERE id = $id",
+                    {"id": episode_id}
+                )
+            except Exception as e:
+                logger.warning("Mark episode consolidated failed: %s", e)
+        else:
+            for r in self._mem.get("episode", []):
+                if r.get("id") == episode_id:
+                    r["consolidated"] = True
+                    break
 
     # ============================================================
     # Graph Traversal

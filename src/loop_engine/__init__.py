@@ -308,11 +308,47 @@ Respond with ONLY the JSON array, no other text."""
 
     async def _self_evaluate(self, task_scope: str, steps: list[StepLog],
                              artifacts: dict) -> float:
-        """Agent self-evaluates its own output quality."""
+        """Agent self-evaluates its own output quality using LLM.
+
+        Constructs an evaluation prompt, parses LLM JSON response.
+        Falls back to simple heuristics on failure.
+        """
         if not steps:
             return 0.0
 
-        # Basic heuristics
+        # Gather errors
+        errors = [s.error for s in steps if s.error]
+
+        # Build evaluation prompt
+        prompt = f"""You are a quality evaluator. Rate the agent output on a 0-1 scale.
+
+Task: {task_scope}
+Steps completed: {len(steps)}
+Artifacts: {list(artifacts.keys())}
+Errors: {errors if errors else 'none'}
+
+Output JSON only: {{"score": <number between 0 and 1>, "reason": "<brief explanation>"}}"""
+
+        try:
+            import json
+            response = await self.llm.chat([{"role": "user", "content": prompt}])
+            # Extract JSON from response (may be wrapped in markdown code block)
+            content = response.content.strip()
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0]
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0]
+            result = json.loads(content)
+            score = float(result.get("score", 0.5))
+            logger.info("LLM self-eval score=%.2f reason=%s", score, result.get("reason", ""))
+            return min(1.0, max(0.0, score))
+
+        except Exception as e:
+            logger.warning("LLM self-eval failed: %s, falling back to heuristics", e)
+            return self._heuristic_evaluate(steps)
+
+    def _heuristic_evaluate(self, steps: list[StepLog]) -> float:
+        """Fallback heuristic evaluation."""
         completeness = 1.0 if any(s.tool_name for s in steps) else 0.3
         correctness = 1.0 if not any(s.error for s in steps) else max(0.0, 1.0 - sum(1 for s in steps if s.error) / len(steps) * 0.5)
         relevance = 1.0 if len(steps) >= 2 else 0.5
@@ -328,7 +364,33 @@ Respond with ONLY the JSON array, no other text."""
 
     async def _generate_summary(self, task_scope: str, steps: list[StepLog],
                                 artifacts: dict) -> str:
-        """Generate a human-readable summary of what the agent did."""
+        """Generate a human-readable summary using LLM.
+
+        Falls back to string concatenation on failure.
+        """
+        # Gather errors
+        errors = [s.error for s in steps if s.error]
+
+        prompt = f"""Summarize the following agent execution in 1-3 natural language sentences.
+
+Task: {task_scope}
+Steps executed: {len(steps)}
+Step descriptions: {[s.action for s in steps]}
+Artifacts produced: {list(artifacts.keys())}
+Errors encountered: {errors if errors else 'none'}
+
+Provide a concise summary:"""
+
+        try:
+            response = await self.llm.chat([{"role": "user", "content": prompt}])
+            summary = response.content.strip()
+            if summary:
+                logger.info("LLM summary generated: %s", summary[:80])
+                return summary
+        except Exception as e:
+            logger.warning("LLM summary failed: %s, falling back to string concat", e)
+
+        # Fallback: simple string concatenation
         parts = [f"Task: {task_scope}"]
         for s in steps:
             parts.append(f"  Step {s.step}: {s.action}" + (f" [ERROR: {s.error}]" if s.error else ""))

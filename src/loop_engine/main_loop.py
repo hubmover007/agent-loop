@@ -273,6 +273,19 @@ class MainLoop:
 
         if not ctx.agent_results:
             ctx.final_output = "\n".join(ctx.errors) if ctx.errors else "No results produced."
+            # Still write an episode even with no results
+            try:
+                await self.memory.store({
+                    "type": "episode",
+                    "title": f"Session: {ctx.user_input[:80]}",
+                    "user_input": ctx.user_input,
+                    "output": ctx.final_output,
+                    "task_count": len(ctx.task_ids),
+                    "session_id": ctx.session_id,
+                    "tags": ["session", "empty"],
+                })
+            except Exception as e:
+                logger.warning("Failed to write episode: %s", e)
             return
 
         # Synthesize results
@@ -280,20 +293,25 @@ class MainLoop:
         for result in ctx.agent_results:
             parts.append(f"### {result.summary}")
 
-        # Write a new Episode to memory for future retrieval
-        try:
-            await self.memory.write_episode(
-                title=f"Session: {ctx.user_input[:80]}",
-                summary="\n\n".join(parts),
-                content=ctx.reason_output,
-                tags=["session", datetime.now().strftime("%Y-%m-%d")],
-            )
-        except Exception as e:
-            logger.warning("Failed to write episode: %s", e)
-
         ctx.final_output = "\n\n".join(parts)
         if ctx.errors:
             ctx.final_output += "\n\n⚠️ Issues encountered:\n" + "\n".join(f"- {e}" for e in ctx.errors)
+
+        # Write a new Episode to memory for future retrieval
+        try:
+            await self.memory.store({
+                "type": "episode",
+                "title": f"Session: {ctx.user_input[:80]}",
+                "user_input": ctx.user_input,
+                "output": ctx.final_output,
+                "summary": ctx.final_output[:200],
+                "content": ctx.reason_output,
+                "task_count": len(ctx.task_ids),
+                "session_id": ctx.session_id,
+                "tags": ["session", datetime.now().strftime("%Y-%m-%d")],
+            })
+        except Exception as e:
+            logger.warning("Failed to write episode: %s", e)
 
         logger.info("MainLoop[%s]: OUTPUT completed", ctx.session_id)
 
