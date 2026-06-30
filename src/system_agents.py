@@ -467,6 +467,10 @@ class AgentManagerAgent:
         # Lock for thread-safe mutation of pool and in-flight state
         self._lock = asyncio.Lock()
 
+        # Config hot-reload
+        self._config_mtime: float = 0
+        self._config_path: str = "config/permissions.json"
+
     # ── Persistence: startup restore ───────────────────────────────────
 
     async def delegate_task(self,
@@ -1186,6 +1190,28 @@ class AgentManagerAgent:
             if task.result:
                 results[task.task_id] = task.result
         return results
+
+    # ── Config hot-reload ───────────────────────────────────────────
+
+    def _check_config_reload(self) -> bool:
+        """Check if the configuration file has been modified since last load."""
+        try:
+            mtime = os.path.getmtime(self._config_path)
+            if mtime > self._config_mtime:
+                self._config_mtime = mtime
+                return True
+        except OSError:
+            pass
+        return False
+
+    async def maybe_reload_config(self) -> bool:
+        """Reload the configuration if the file has been modified."""
+        if self._check_config_reload():
+            if self.permission_checker:
+                self.permission_checker.reload()
+                logger.info("Config reloaded: %s", self._config_path)
+            return True
+        return False
 
     async def cancel(self, task_id: str) -> None:
         """Cancel a task and destroy its agent."""

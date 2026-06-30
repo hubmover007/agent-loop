@@ -252,8 +252,70 @@ class MemoryPool:
         return summary
 
     # ============================================================
-    # Write Operations
+    # Generic memory save/load (for project docs, etc.)
     # ============================================================
+
+    async def save(self, agent_id: str, content: str,
+                   metadata: dict | None = None) -> str:
+        """Save a generic memory entry for an agent.
+
+        Used by project docs and other general-purpose memory.
+        Returns the entry key.
+        """
+        import time as _time
+        key = f"agent_{agent_id}:mem:{int(_time.time() * 1000)}"
+        entry = {
+            "id": key,
+            "agent_id": agent_id,
+            "content": content,
+            "metadata": metadata or {},
+            "created_at": _time.time(),
+        }
+        collection = f"agent_{agent_id}"
+        self._mem.setdefault(collection, []).append(entry)
+        self._save_to_db(key, entry)
+        return key
+
+    def _get_by_agent(self, agent_id: str) -> list[dict]:
+        """Get all memory entries for a given agent.
+
+        Returns entries from either in-memory store or SQLite.
+        """
+        collection = f"agent_{agent_id}"
+        if collection in self._mem:
+            return list(self._mem[collection])
+        # Try to load from SQLite
+        if self._sqlite:
+            loaded = self._load_from_db()
+            if collection in loaded:
+                self._mem[collection] = loaded[collection]
+                return list(self._mem[collection])
+        return []
+
+    async def save_project_doc(self, agent_id: str, doc_type: str,
+                               content: str) -> None:
+        """Save a project-level document.
+
+        doc_type: prompt / plan / implement / documentation
+        """
+        await self.save(agent_id, content, {
+            "type": "project_doc",
+            "doc_type": doc_type,
+        })
+        logger.debug("MemoryPool: saved project doc '%s' for %s", doc_type, agent_id)
+
+    async def load_project_docs(self, agent_id: str) -> dict[str, str]:
+        """Load all project documents for an agent.
+
+        Returns dict of doc_type → content.
+        """
+        memories = self._get_by_agent(agent_id)
+        docs: dict[str, str] = {}
+        for m in memories:
+            meta = m.get("metadata", {})
+            if meta.get("type") == "project_doc":
+                docs[meta["doc_type"]] = m.get("content", "")
+        return docs
 
     async def write_fact(self, fact_type: str, name: str, value: Any = None,
                          embedding_text: str | None = None) -> str:

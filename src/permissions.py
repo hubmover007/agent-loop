@@ -65,6 +65,10 @@ class AgentPermissions:
         self._call_times: list[float] = []  # Rate limit tracking
         self._load()
 
+    def reload(self) -> None:
+        """Reload the configuration from disk."""
+        self._load()
+
     def _load(self) -> None:
         """Load permission config from JSON and resolve template."""
         if not self._config_path.exists():
@@ -303,6 +307,12 @@ class PermissionChecker:
     def __init__(self, config_path: str | Path = "config/permissions.json"):
         self._config_path = Path(config_path)
         self._cache: dict[str, AgentPermissions] = {}
+
+    def reload(self) -> None:
+        """Reload all cached AgentPermissions from the config file."""
+        for perms in self._cache.values():
+            perms.reload()
+        logger.info("PermissionChecker: reloaded %d cached permissions", len(self._cache))
 
     def get_permissions(
         self, agent_id: str, template: str

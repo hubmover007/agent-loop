@@ -255,7 +255,9 @@ class AgentLoop:
                  sandbox: Any | None = None,
                  agent_permissions: Any | None = None,
                  max_iterations: int = DEFAULT_MAX_ITERATIONS,
-                 timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS):
+                 timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+                 plan_mode: bool = False,
+                 max_replans: int = 3):
         self.tool_loop = tool_loop
         self.llm = llm
         self.config = config
@@ -270,6 +272,11 @@ class AgentLoop:
         self.agent_permissions = agent_permissions  # Optional AgentPermissions for access control
         self.max_iterations = max_iterations  # P0: Max agent loop iterations
         self.timeout_seconds = timeout_seconds  # P0: Agent timeout in seconds
+        self.plan_mode = plan_mode  # P2.5: Plan mode — require user approval before executing
+        self.max_replans = max_replans  # P2: Max replan attempts on low eval score
+        self._replan_context: dict | None = None  # P2: Context for replan feedback
+        self._verify_config: dict | None = None  # P2.5: Per-step verification config
+        self._last_eval_reason: str = ""  # P2: Latest eval reason for replan feedback
 
     async def run(self, agent_id: str, task_scope: str, context: dict,
                   allowed_tools: list[str],
@@ -283,6 +290,10 @@ class AgentLoop:
           4. EVOLVE — write JOURNAL.md + update profile.json (if score >= threshold)
           5. SUBMIT — return result (or self-destruct on failure)
 
+        P2: If SELF_EVAL score < 0.4, replans up to max_replans times.
+        P2.5: If plan_mode=True, requests user approval after PLAN.
+        P2.5: Stop-and-Fix — if a step has verification, fix before continuing.
+
         If multimodal_inputs is provided and multimodal_processor is set,
         media inputs are processed into content blocks attached to context.
 
@@ -293,21 +304,13 @@ class AgentLoop:
         iteration = 0
         started_at = datetime.now(timezone.utc)
         loop_start_time = time.time()
+        replan_count = 0
+        self._replan_context = None
 
-        # ── P0: Iteration & timeout guard ──────────────────────────
-        # AgentLoop.run() is a single-pass per invocation; the iteration
-        # counter is checked once here and at timeout points.
-        # Multi-pass retry logic lives at MainLoop level.
-        iteration += 1
-        if iteration > self.max_iterations:
-            logger.warning("AgentLoop[%s]: max iterations (%d) reached before start",
-                           agent_id, self.max_iterations)
-            return TaskResult(
-                task_id=context.get("task_id", ""),
-                agent_id=agent_id,
-                status=TaskStatus.FAILED,
-                summary=f"Max iterations ({self.max_iterations}) reached",
-            )
+        # P2.5: Extract verification config from context
+        self._verify_config = context.get("_verify_config", None)
+
+        # ── P0: Timeout guard ──────────────────────────
         if time.time() - loop_start_time > self.timeout_seconds:
             logger.warning("AgentLoop[%s]: timeout %ds exceeded before start",
                            agent_id, self.timeout_seconds)
@@ -334,12 +337,34 @@ class AgentLoop:
             if self.emitter:
                 self.emitter.emit(ev_type, phase, msg, **kw)
 
-        try:
-            # Phase 1: PLAN
-            _emit("phase_start", "PLAN", f"Starting plan for: {task_scope[:80]}")
+        # ── Initialize result variables ──
+        status = TaskStatus.FAILED
+        summary = ""
 
-            # ── P0: Timeout guard ──────────────────────────────
+        # ── P0: Max iterations guard ──
+        if self.max_iterations <= 0:
+            return TaskResult(
+                task_id=context.get("task_id", ""),
+                agent_id=agent_id,
+                status=TaskStatus.FAILED,
+                summary=f"Max iterations ({self.max_iterations}) reached",
+            )
+
+        # ── P2: Replan loop ────────────────────────────
+        while iteration < self.max_iterations:
+            iteration += 1
+            if iteration > self.max_iterations:
+                logger.warning("AgentLoop[%s]: max iterations (%d) reached before start",
+                               agent_id, self.max_iterations)
+                return TaskResult(
+                    task_id=context.get("task_id", ""),
+                    agent_id=agent_id,
+                    status=TaskStatus.FAILED,
+                    summary=f"Max iterations ({self.max_iterations}) reached",
+                )
             if time.time() - loop_start_time > self.timeout_seconds:
+                logger.warning("AgentLoop[%s]: timeout %ds exceeded before start",
+                               agent_id, self.timeout_seconds)
                 return TaskResult(
                     task_id=context.get("task_id", ""),
                     agent_id=agent_id,
@@ -347,24 +372,38 @@ class AgentLoop:
                     summary=f"Timeout after {self.timeout_seconds}s",
                 )
 
-            plan = await self._plan(task_scope, context)
-            steps.append(StepLog(step=0, action="plan", tool_name=None, output=plan))
-            _emit("phase_done", "PLAN", f"Plan generated: {len(plan)} steps")
+            # Reset per-attempt state
+            steps = []
+            artifacts = {}
 
-            # ── P0: Timeout guard after plan ──────────────────
-            if time.time() - loop_start_time > self.timeout_seconds:
-                return TaskResult(
-                    task_id=context.get("task_id", ""),
-                    agent_id=agent_id,
-                    status=TaskStatus.FAILED,
-                    summary=f"Timeout after {self.timeout_seconds}s",
-                )
+            try:
+                # Phase 1: PLAN
+                _emit("phase_start", "PLAN", f"Starting plan for: {task_scope[:80]}")
+                plan = await self._plan(task_scope, context)
+                steps.append(StepLog(step=0, action="plan", tool_name=None, output=plan))
+                _emit("phase_done", "PLAN", f"Plan generated: {len(plan)} steps")
 
-            # Phase 2: EXECUTE
-            _emit("phase_start", "EXECUTE", f"Executing {len(plan)} steps")
-            step_num = 1
-            for action in plan:
-                # ── P0: Timeout guard during execution ─────────
+                # P2.5: Plan Mode — request user approval
+                if self.plan_mode and self.interaction_hub:
+                    try:
+                        approval = await self.interaction_hub.request_approval(
+                            agent_id=agent_id,
+                            action="plan_approval",
+                            details=f"Proposed plan:\n{plan}",
+                            risk_level="medium",
+                        )
+                        if approval.status != "approved":
+                            return TaskResult(
+                                task_id=context.get("task_id", ""),
+                                agent_id=agent_id,
+                                status=TaskStatus.FAILED,
+                                summary=f"Plan rejected by user: {approval.status}",
+                            )
+                    except Exception as e:
+                        logger.warning("AgentLoop[%s]: plan approval error: %s", agent_id, e)
+                        # If approval fails, still execute (graceful degradation)
+
+                # ── P0: Timeout guard after plan ──────────────────
                 if time.time() - loop_start_time > self.timeout_seconds:
                     return TaskResult(
                         task_id=context.get("task_id", ""),
@@ -373,273 +412,331 @@ class AgentLoop:
                         summary=f"Timeout after {self.timeout_seconds}s",
                     )
 
-                if step_num > self.config.max_agent_steps:
-                    steps.append(StepLog(
-                        step=step_num, action="abort",
-                        tool_name=None, error="Max steps exceeded"
-                    ))
-                    break
+                # Phase 2: EXECUTE
+                _emit("phase_start", "EXECUTE", f"Executing {len(plan)} steps")
+                step_num = 1
+                for action in plan:
+                    # ── P0: Timeout guard during execution ─────────
+                    if time.time() - loop_start_time > self.timeout_seconds:
+                        return TaskResult(
+                            task_id=context.get("task_id", ""),
+                            agent_id=agent_id,
+                            status=TaskStatus.FAILED,
+                            summary=f"Timeout after {self.timeout_seconds}s",
+                        )
 
-                # Check if this step requires a tool call
-                tool_name = action.get("tool")
-                # Allow tool if: (1) in allowed_tools list, OR (2) registered in tool_registry
-                tool_allowed = (tool_name in allowed_tools) if allowed_tools else True
-                if not tool_allowed and self.tool_registry is not None:
-                    spec = self.tool_registry.get(tool_name)
-                    tool_allowed = spec is not None and spec.enabled
-                if tool_name and tool_allowed:
-                    # ── Human-in-the-Loop: check high-risk operations ─────
-                    if self.interaction_hub is not None:
-                        from ..interaction import detect_risk_level, RISK_LEVEL_ORDER
-                        action_desc = action.get("description", "") or str(action.get("params", {}))
-                        tool_cmd = f"{tool_name} {action_desc}"
-                        risk = detect_risk_level(tool_cmd)
-                        if risk and RISK_LEVEL_ORDER.get(risk, 0) >= RISK_LEVEL_ORDER.get(self.interaction_hub._risk_threshold, 1):
-                            _emit("approval_needed", "EXECUTE",
-                                  f"Approval needed: {tool_name}", risk_level=risk)
+                    if step_num > self.config.max_agent_steps:
+                        steps.append(StepLog(
+                            step=step_num, action="abort",
+                            tool_name=None, error="Max steps exceeded"
+                        ))
+                        break
+
+                    # Check if this step requires a tool call
+                    tool_name = action.get("tool")
+                    # Allow tool if: (1) in allowed_tools list, OR (2) registered in tool_registry
+                    tool_allowed = (tool_name in allowed_tools) if allowed_tools else True
+                    if not tool_allowed and self.tool_registry is not None:
+                        spec = self.tool_registry.get(tool_name)
+                        tool_allowed = spec is not None and spec.enabled
+                    if tool_name and tool_allowed:
+                        # ── Human-in-the-Loop: check high-risk operations ─────
+                        if self.interaction_hub is not None:
+                            from ..interaction import detect_risk_level, RISK_LEVEL_ORDER
+                            action_desc = action.get("description", "") or str(action.get("params", {}))
+                            tool_cmd = f"{tool_name} {action_desc}"
+                            risk = detect_risk_level(tool_cmd)
+                            if risk and RISK_LEVEL_ORDER.get(risk, 0) >= RISK_LEVEL_ORDER.get(self.interaction_hub._risk_threshold, 1):
+                                _emit("approval_needed", "EXECUTE",
+                                      f"Approval needed: {tool_name}", risk_level=risk)
+                                try:
+                                    approval = await self.interaction_hub.request_approval(
+                                        agent_id=agent_id,
+                                        action=f"{tool_name}: {action_desc}",
+                                        details=str(action.get("params", {})),
+                                        risk_level=risk,
+                                        task_scope=task_scope,
+                                    )
+                                    if approval.status != "approved":
+                                        steps.append(StepLog(
+                                            step=step_num,
+                                            action=f"blocked: {tool_name}",
+                                            tool_name=tool_name,
+                                            error=f"User {approval.status}: {approval.reply}",
+                                        ))
+                                        break
+                                except Exception as e:
+                                    logger.warning("AgentLoop[%s]: interaction hub error: %s", agent_id, e)
+
+                        # ── Mailbox: check for incoming messages before step ────
+                        if self.mailbox is not None:
                             try:
-                                approval = await self.interaction_hub.request_approval(
-                                    agent_id=agent_id,
-                                    action=f"{tool_name}: {action_desc}",
-                                    details=str(action.get("params", {})),
-                                    risk_level=risk,
-                                    task_scope=task_scope,
-                                )
-                                if approval.status != "approved":
+                                msg = await self.mailbox.receive(timeout=0.5)
+                                if msg and msg.type == "handoff":
+                                    steps.append(StepLog(
+                                        step=step_num,
+                                        action=f"handoff from {msg.from_agent}",
+                                        tool_name=None,
+                                        output=msg.body,
+                                    ))
+                                    logger.info("AgentLoop[%s]: received handoff from %s", agent_id, msg.from_agent)
+                            except Exception:
+                                pass  # Mailbox receive timeout is fine
+
+                        # ── Rate limit check ────────────────────────────────────
+                        if (self.agent_permissions is not None
+                                and hasattr(self.agent_permissions, 'check_rate_limit')):
+                            if not self.agent_permissions.check_rate_limit():
+                                await asyncio.sleep(1)
+                                if not self.agent_permissions.check_rate_limit():
                                     steps.append(StepLog(
                                         step=step_num,
                                         action=f"blocked: {tool_name}",
                                         tool_name=tool_name,
-                                        error=f"User {approval.status}: {approval.reply}",
+                                        error="Rate limit exceeded",
                                     ))
                                     break
-                            except Exception as e:
-                                logger.warning("AgentLoop[%s]: interaction hub error: %s", agent_id, e)
 
-                    # ── Mailbox: check for incoming messages before step ────
-                    if self.mailbox is not None:
-                        try:
-                            msg = await self.mailbox.receive(timeout=0.5)
-                            if msg and msg.type == "handoff":
-                                steps.append(StepLog(
-                                    step=step_num,
-                                    action=f"handoff from {msg.from_agent}",
-                                    tool_name=None,
-                                    output=msg.body,
-                                ))
-                                logger.info("AgentLoop[%s]: received handoff from %s", agent_id, msg.from_agent)
-                        except Exception:
-                            pass  # Mailbox receive timeout is fine
+                        _emit("tool_call", "EXECUTE", f"Calling {tool_name}",
+                              step=step_num, params=action.get("params", {}))
 
-                    # ── Rate limit check ────────────────────────────────────
-                    if (self.agent_permissions is not None
-                            and hasattr(self.agent_permissions, 'check_rate_limit')):
-                        if not self.agent_permissions.check_rate_limit():
-                            await asyncio.sleep(1)
-                            if not self.agent_permissions.check_rate_limit():
-                                steps.append(StepLog(
-                                    step=step_num,
-                                    action=f"blocked: {tool_name}",
-                                    tool_name=tool_name,
-                                    error="Rate limit exceeded",
-                                ))
-                                break
-
-                    _emit("tool_call", "EXECUTE", f"Calling {tool_name}",
-                          step=step_num, params=action.get("params", {}))
-
-                    # ── Sandbox: code execution tools go through SandboxManager ──
-                    if (self.sandbox is not None
-                            and tool_name in ('code.execute', 'shell.run_command', 'run_code',
-                                             'shell.exec', 'python.exec')):
-                        tool_params = action.get("params", {})
-                        command = tool_params.get('command', tool_params.get('code', ''))
-                        language = tool_params.get('language',
-                            'python' if tool_name in ('run_code', 'python.exec') else 'shell')
-                        try:
-                            sandbox_result = await self.sandbox.execute_command(
-                                command,
-                                permissions=self.agent_permissions,
-                                interaction_hub=self.interaction_hub,
-                            )
-                            if sandbox_result.get('exit_code', -1) != 0:
+                        # ── Sandbox: code execution tools go through SandboxManager ──
+                        if (self.sandbox is not None
+                                and tool_name in ('code.execute', 'shell.run_command', 'run_code',
+                                                 'shell.exec', 'python.exec')):
+                            tool_params = action.get("params", {})
+                            command = tool_params.get('command', tool_params.get('code', ''))
+                            language = tool_params.get('language',
+                                'python' if tool_name in ('run_code', 'python.exec') else 'shell')
+                            try:
+                                sandbox_result = await self.sandbox.execute_command(
+                                    command,
+                                    permissions=self.agent_permissions,
+                                    interaction_hub=self.interaction_hub,
+                                )
+                                if sandbox_result.get('exit_code', -1) != 0:
+                                    result = ToolResult(
+                                        status=ToolResultStatus.TRANSIENT_ERROR,
+                                        error=sandbox_result.get('stderr', 'Sandbox execution failed'),
+                                        data=sandbox_result,
+                                    )
+                                else:
+                                    result = ToolResult(
+                                        status=ToolResultStatus.SUCCESS,
+                                        data=sandbox_result,
+                                    )
+                            except Exception as se:
                                 result = ToolResult(
                                     status=ToolResultStatus.TRANSIENT_ERROR,
-                                    error=sandbox_result.get('stderr', 'Sandbox execution failed'),
-                                    data=sandbox_result,
+                                    error=f"Sandbox error: {se}",
                                 )
-                            else:
-                                result = ToolResult(
-                                    status=ToolResultStatus.SUCCESS,
-                                    data=sandbox_result,
-                                )
-                        except Exception as se:
-                            result = ToolResult(
-                                status=ToolResultStatus.TRANSIENT_ERROR,
-                                error=f"Sandbox error: {se}",
-                            )
+                        else:
+                            result = await self.tool_loop.execute(tool_name, **action.get("params", {}))
+
+                        _emit("tool_call", "EXECUTE", f"{tool_name} returned: {result.status.value}",
+                              step=step_num, status=result.status.value)
+                        steps.append(StepLog(
+                            step=step_num,
+                            action=action.get("description", f"execute {tool_name}"),
+                            tool_name=tool_name,
+                            input=action.get("params", {}),
+                            output=result.data if result.status == ToolResultStatus.SUCCESS else None,
+                            error=result.error,
+                        ))
+
+                        # P2.5: Stop-and-Fix — verify step, fix on failure
+                        if self._verify_config:
+                            verify_cmd = self._verify_config.get(action.get("description", ""))
+                            if verify_cmd:
+                                verification = await self._verify_step(action.get("description", tool_name or "step"), verify_cmd)
+                                if not verification.passed:
+                                    fix_result = await self._fix_step(
+                                        action.get("description", tool_name or "step"), verification.error
+                                    )
+                                    if not fix_result.success:
+                                        return TaskResult(
+                                            task_id=context.get("task_id", ""),
+                                            agent_id=agent_id,
+                                            status=TaskStatus.FAILED,
+                                            summary=f"Step '{action.get('description', '')}' failed and fix attempt failed: {fix_result.error}",
+                                        )
+
+                        if result.status == ToolResultStatus.FATAL_ERROR:
+                            break
+
+                        if result.data:
+                            artifacts[action.get("output_key", f"step_{step_num}")] = result.data
                     else:
-                        result = await self.tool_loop.execute(tool_name, **action.get("params", {}))
+                        # Pure reasoning step
+                        steps.append(StepLog(
+                            step=step_num,
+                            action=action.get("description", "reason"),
+                            tool_name=None,
+                        ))
 
-                    _emit("tool_call", "EXECUTE", f"{tool_name} returned: {result.status.value}",
-                          step=step_num, status=result.status.value)
-                    steps.append(StepLog(
-                        step=step_num,
-                        action=action.get("description", f"execute {tool_name}"),
-                        tool_name=tool_name,
-                        input=action.get("params", {}),
-                        output=result.data if result.status == ToolResultStatus.SUCCESS else None,
-                        error=result.error,
-                    ))
+                    step_num += 1
 
-                    if result.status == ToolResultStatus.FATAL_ERROR:
+                    # Check TTL
+                    if (datetime.now(timezone.utc) - started_at).total_seconds() > self.config.agent_ttl:
+                        logger.warning("AgentLoop[%s]: TTL exceeded", agent_id)
+                        steps.append(StepLog(
+                            step=step_num, action="abort",
+                            tool_name=None, error="Agent TTL exceeded"
+                        ))
                         break
 
-                    if result.data:
-                        artifacts[action.get("output_key", f"step_{step_num}")] = result.data
-                else:
-                    # Pure reasoning step
-                    steps.append(StepLog(
-                        step=step_num,
-                        action=action.get("description", "reason"),
-                        tool_name=None,
-                    ))
+                _emit("phase_done", "EXECUTE",
+                      f"Execution complete: {len([s for s in steps if s.tool_name])} tool calls")
 
-                step_num += 1
+                # Phase 3: SELF_EVAL
+                _emit("phase_start", "SELF_EVAL", "Running self-evaluation")
+                eval_score = await self._self_evaluate(task_scope, steps, artifacts)
+                eval_reason = self._last_eval_reason
+                _emit("phase_done", "SELF_EVAL", f"Self-eval score: {eval_score:.2f}")
 
-                # Check TTL
-                if (datetime.now(timezone.utc) - started_at).total_seconds() > self.config.agent_ttl:
-                    logger.warning("AgentLoop[%s]: TTL exceeded", agent_id)
-                    steps.append(StepLog(
-                        step=step_num, action="abort",
-                        tool_name=None, error="Agent TTL exceeded"
-                    ))
-                    break
+                # ── P2: Replan on low score ──────────────────
+                if eval_score < 0.4 and replan_count < self.max_replans:
+                    self._replan_context = {
+                        "previous_plan": plan,
+                        "failure_reason": eval_reason,
+                        "attempt": replan_count + 1,
+                    }
+                    replan_count += 1
+                    logger.warning("AgentLoop[%s]: replanning (attempt %d/%d, score=%.2f)",
+                                   agent_id, replan_count, self.max_replans, eval_score)
+                    _emit("phase_start", "REPLAN", f"Replanning: attempt {replan_count}/{self.max_replans}")
+                    continue  # Back to PLAN
 
-            _emit("phase_done", "EXECUTE",
-                  f"Execution complete: {len([s for s in steps if s.tool_name])} tool calls")
+                # Phase 4: EVOLVE — structured evolution + legacy journal
+                _emit("phase_start", "EVOLVE", f"Starting evolution (score={eval_score:.2f})")
 
-            # Phase 3: SELF_EVAL
-            _emit("phase_start", "SELF_EVAL", "Running self-evaluation")
-            eval_result = await self._self_evaluate(task_scope, steps, artifacts)
-            _emit("phase_done", "SELF_EVAL", f"Self-eval score: {eval_result:.2f}")
-
-            # Phase 4: EVOLVE — structured evolution + legacy journal
-            _emit("phase_start", "EVOLVE", f"Starting evolution (score={eval_result:.2f})")
-
-            # ── Structured evolution (EvolutionEngine) ──
-            if self.evolution:
-                try:
-                    from ..evolution import JournalEntry as JEntry
-                    import uuid as _uuid
-                    from datetime import timezone as _tz, datetime as _dt
-
-                    tools_used = list(set(
-                        s.tool_name for s in steps if s.tool_name
-                    ))
-                    duration = (_dt.now(_tz.utc) - started_at).total_seconds()
-
-                    task_type = "coding" if any(kw in task_scope.lower()
-                        for kw in ["code", "debug", "implement", "refactor", "pull"]) \
-                        else "reasoning" if any(kw in task_scope.lower()
-                        for kw in ["reason", "analyze", "plan", "think"]) \
-                        else "ops" if any(kw in task_scope.lower()
-                        for kw in ["deploy", "ssh", "docker", "server"]) \
-                        else "general"
-
-                    outcome = "success" if eval_result >= self.config.accept_threshold else \
-                        "partial" if eval_result >= self.config.accept_threshold * 0.7 else "failure"
-
-                    entry = JEntry(
-                        id=f"entry:{_uuid.uuid4().hex[:8]}",
-                        timestamp=_dt.now(_tz.utc).isoformat(),
-                        task_scope=task_scope,
-                        task_type=task_type,
-                        outcome=outcome,
-                        score=round(eval_result, 2),
-                        duration_seconds=duration,
-                        tools_used=tools_used,
-                        llm_provider=getattr(self.llm, "model", "unknown"),
-                        cost_estimate=duration * 0.001,
-                        lessons=[s.error for s in steps if s.error] if outcome == "failure" else [],
-                        tags=[task_type, outcome],
-                    )
-                    await self.evolution.record_entry(entry)
-                    await self.evolution.adjust_traits(entry)
-                    await self.evolution.extract_knowledge()
-                    logger.debug("AgentLoop[%s]: EVOLVE — structured evolution recorded", agent_id)
-                except Exception as ev:
-                    logger.warning("AgentLoop[%s]: EVOLVE (structured) failed: %s", agent_id, ev)
-
-            # ── Legacy evolution (AgentSoul) for backward compat ──
-            if eval_result >= self.config.accept_threshold and self.agent_soul:
-                try:
-                    await self.agent_soul.evolve(
-                        f"Completed: {task_scope}. Score: {eval_result:.2f}"
-                    )
-                    # Reward: increase efficiency on success
-                    await self.agent_soul.update_identity_trait("efficiency", +0.02)
-                    await self.agent_soul.record_task(success=True)
-                    logger.debug("AgentLoop[%s]: EVOLVE — soul updated", agent_id)
-                except Exception as ev:
-                    logger.warning("AgentLoop[%s]: EVOLVE failed: %s", agent_id, ev)
-            elif self.agent_soul:
-                # Record failure for learning
-                try:
-                    await self.agent_soul.evolve(
-                        f"Failed: {task_scope}. Score: {eval_result:.2f}"
-                    )
-                    # Punish: decrease efficiency on failure
-                    await self.agent_soul.update_identity_trait("efficiency", -0.05)
-                    await self.agent_soul.record_task(success=False)
-                except Exception as ev:
-                    logger.warning("AgentLoop[%s]: EVOLVE failed: %s", agent_id, ev)
-
-            # ── Self-modification: Agent autonomously adjusts IDENTITY on high scores ──
-            if self.agent_soul and hasattr(self.agent_soul, 'self_modify'):
-                if eval_result > 0.85:
+                # ── Structured evolution (EvolutionEngine) ──
+                if self.evolution:
                     try:
-                        # Only self-modify if permissions allow (or no permissions check)
-                        can_modify = (
-                            self.agent_permissions is None
-                            or self.agent_permissions.can_modify_file('identity')
+                        from ..evolution import JournalEntry as JEntry
+                        import uuid as _uuid
+                        from datetime import timezone as _tz, datetime as _dt
+
+                        tools_used = list(set(
+                            s.tool_name for s in steps if s.tool_name
+                        ))
+                        duration = (_dt.now(_tz.utc) - started_at).total_seconds()
+
+                        task_type = "coding" if any(kw in task_scope.lower()
+                            for kw in ["code", "debug", "implement", "refactor", "pull"]) \
+                            else "reasoning" if any(kw in task_scope.lower()
+                            for kw in ["reason", "analyze", "plan", "think"]) \
+                            else "ops" if any(kw in task_scope.lower()
+                            for kw in ["deploy", "ssh", "docker", "server"]) \
+                            else "general"
+
+                        outcome = "success" if eval_score >= self.config.accept_threshold else \
+                            "partial" if eval_score >= self.config.accept_threshold * 0.7 else "failure"
+
+                        entry = JEntry(
+                            id=f"entry:{_uuid.uuid4().hex[:8]}",
+                            timestamp=_dt.now(_tz.utc).isoformat(),
+                            task_scope=task_scope,
+                            task_type=task_type,
+                            outcome=outcome,
+                            score=round(eval_score, 2),
+                            duration_seconds=duration,
+                            tools_used=tools_used,
+                            llm_provider=getattr(self.llm, "model", "unknown"),
+                            cost_estimate=duration * 0.001,
+                            lessons=[s.error for s in steps if s.error] if outcome == "failure" else [],
+                            tags=[task_type, outcome],
                         )
-                        if can_modify:
-                            current = self.agent_soul.identity_content
-                            if 'experience' not in current.lower():
-                                new_content = current + '\n\n## 经验\n积累了成功的执行经验。'
-                                await self.agent_soul.self_modify(
-                                    'identity', new_content, self.agent_permissions
-                                )
-                                logger.debug(
-                                    "AgentLoop[%s]: EVOLVE — self_modify IDENTITY enhanced",
-                                    agent_id
-                                )
-                    except Exception:
-                        pass  # self_modify failure doesn't affect main flow
+                        await self.evolution.record_entry(entry)
+                        await self.evolution.adjust_traits(entry)
+                        await self.evolution.extract_knowledge()
+                        logger.debug("AgentLoop[%s]: EVOLVE — structured evolution recorded", agent_id)
+                    except Exception as ev:
+                        logger.warning("AgentLoop[%s]: EVOLVE (structured) failed: %s", agent_id, ev)
 
-            _emit("phase_done", "EVOLVE", f"Evolution complete")
+                # ── Legacy evolution (AgentSoul) for backward compat ──
+                if eval_score >= self.config.accept_threshold and self.agent_soul:
+                    try:
+                        await self.agent_soul.evolve(
+                            f"Completed: {task_scope}. Score: {eval_score:.2f}"
+                        )
+                        # Reward: increase efficiency on success
+                        await self.agent_soul.update_identity_trait("efficiency", +0.02)
+                        await self.agent_soul.record_task(success=True)
+                        logger.debug("AgentLoop[%s]: EVOLVE — soul updated", agent_id)
+                    except Exception as ev:
+                        logger.warning("AgentLoop[%s]: EVOLVE failed: %s", agent_id, ev)
+                elif self.agent_soul:
+                    # Record failure for learning
+                    try:
+                        await self.agent_soul.evolve(
+                            f"Failed: {task_scope}. Score: {eval_score:.2f}"
+                        )
+                        # Punish: decrease efficiency on failure
+                        await self.agent_soul.update_identity_trait("efficiency", -0.05)
+                        await self.agent_soul.record_task(success=False)
+                    except Exception as ev:
+                        logger.warning("AgentLoop[%s]: EVOLVE failed: %s", agent_id, ev)
 
-            # Phase 5: SUBMIT (or self-destruct)
-            if eval_result >= self.config.accept_threshold:
-                status = TaskStatus.DONE
-                summary = await self._generate_summary(task_scope, steps, artifacts)
-                logger.info("AgentLoop[%s]: completed (score=%.2f)", agent_id, eval_result)
-            else:
+                # ── Self-modification: Agent autonomously adjusts IDENTITY on high scores ──
+                if self.agent_soul and hasattr(self.agent_soul, 'self_modify'):
+                    if eval_score > 0.85:
+                        try:
+                            # Only self-modify if permissions allow (or no permissions check)
+                            can_modify = (
+                                self.agent_permissions is None
+                                or self.agent_permissions.can_modify_file('identity')
+                            )
+                            if can_modify:
+                                current = self.agent_soul.identity_content
+                                if 'experience' not in current.lower():
+                                    new_content = current + '\n\n## 经验\n积累了成功的执行经验。'
+                                    await self.agent_soul.self_modify(
+                                        'identity', new_content, self.agent_permissions
+                                    )
+                                    logger.debug(
+                                        "AgentLoop[%s]: EVOLVE — self_modify IDENTITY enhanced",
+                                        agent_id
+                                    )
+                        except Exception:
+                            pass  # self_modify failure doesn't affect main flow
+
+                _emit("phase_done", "EVOLVE", f"Evolution complete")
+
+                # Phase 5: SUBMIT (or self-destruct)
+                if eval_score >= self.config.accept_threshold:
+                    status = TaskStatus.DONE
+                    summary = await self._generate_summary(task_scope, steps, artifacts)
+                    logger.info("AgentLoop[%s]: completed (score=%.2f)", agent_id, eval_score)
+                else:
+                    status = TaskStatus.FAILED
+                    summary = f"Self-evaluation failed (score={eval_score:.2f})"
+                    logger.warning("AgentLoop[%s]: self-destruct (score=%.2f)", agent_id, eval_score)
+
+            except Exception as e:
+                _emit("error", "EXECUTE", f"Agent error: {e}", error=str(e))
+                if replan_count < self.max_replans:
+                    self._replan_context = {
+                        "previous_plan": plan if 'plan' in dir() else None,
+                        "failure_reason": str(e),
+                        "attempt": replan_count + 1,
+                    }
+                    replan_count += 1
+                    logger.warning("AgentLoop[%s]: exception triggered replan (attempt %d/%d)",
+                                   agent_id, replan_count, self.max_replans)
+                    continue
                 status = TaskStatus.FAILED
-                summary = f"Self-evaluation failed (score={eval_result:.2f})"
-                logger.warning("AgentLoop[%s]: self-destruct (score=%.2f)", agent_id, eval_result)
+                summary = f"Agent error: {e}"
+                artifacts = {}
+                steps.append(StepLog(
+                    step=len(steps) + 1, action="error",
+                    tool_name=None, error=str(e)
+                ))
+                logger.error("AgentLoop[%s]: error: %s", agent_id, e)
+                break
 
-        except Exception as e:
-            _emit("error", "EXECUTE", f"Agent error: {e}", error=str(e))
-            status = TaskStatus.FAILED
-            summary = f"Agent error: {e}"
-            artifacts = {}
-            steps.append(StepLog(
-                step=len(steps) + 1, action="error",
-                tool_name=None, error=str(e)
-            ))
-            logger.error("AgentLoop[%s]: error: %s", agent_id, e)
+            # Submit result and exit loop
+            break
 
         return TaskResult(
             task_id=context.get("task_id", ""),
@@ -650,13 +747,61 @@ class AgentLoop:
             steps=steps,
         )
 
+    # ── P2.5: Stop-and-Fix helpers ──
+
+    async def _verify_step(self, step: str, verify_command: str) -> Any:
+        """Verify a step result by running a verification command.
+
+        Returns an object with .passed (bool) and .error (str|None) attributes.
+        """
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                verify_command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            passed = proc.returncode == 0
+            return type('V', (), {
+                'passed': passed,
+                'error': stderr.decode() if not passed else None,
+            })()
+        except Exception as e:
+            return type('V', (), {'passed': False, 'error': str(e)})()
+
+    async def _fix_step(self, step: str, error: str) -> Any:
+        """Attempt to fix a failed step using the LLM.
+
+        Returns an object with .success (bool) and .response (str) attributes.
+        """
+        try:
+            fix_prompt = f"Step '{step}' failed with error: {error}\nPlease fix it."
+            response = await self.llm.chat([
+                {"role": "system", "content": "You are a code fixer."},
+                {"role": "user", "content": fix_prompt},
+            ])
+            return type('F', (), {'success': True, 'response': response.content, 'error': None})()
+        except Exception as e:
+            return type('F', (), {'success': False, 'response': '', 'error': str(e)})()
+
     async def _plan(self, task_scope: str, context: dict) -> list[dict]:
         """Generate an execution plan for the task."""
         prompt = f"""You are an execution planner. Given the task and context, produce a step-by-step plan.
 
 Task: {task_scope}
 
-Context: {context}
+Context: {context}"""
+
+        # P2: Include replan feedback if a previous plan failed
+        if self._replan_context:
+            ctx = self._replan_context
+            prompt += f"""
+
+Previous attempt {ctx['attempt']} failed: {ctx['failure_reason']}
+Previous plan: {ctx['previous_plan']}
+Please revise the plan to address the failure."""
+
+        prompt += """
 
 Output a JSON array of steps, each with:
 - "description": what this step does
@@ -664,7 +809,7 @@ Output a JSON array of steps, each with:
 - "params": tool parameters (or empty object)
 - "output_key": key to store result under (or null)
 
-Keep it concise, maximum {self.config.max_agent_steps} steps.
+Keep it concise, maximum """ + str(self.config.max_agent_steps) + """ steps.
 Respond with ONLY the JSON array, no other text."""
 
         try:
@@ -686,10 +831,12 @@ Respond with ONLY the JSON array, no other text."""
                              artifacts: dict) -> float:
         """Agent self-evaluates its own output quality using LLM.
 
-        Constructs an evaluation prompt, parses LLM JSON response.
+        Returns score (0-1). Also stores the reason in self._last_eval_reason
+        for use by the replan loop.
         Falls back to simple heuristics on failure.
         """
         if not steps:
+            self._last_eval_reason = "No steps executed"
             return 0.0
 
         # Gather errors
@@ -713,14 +860,19 @@ Output JSON only: {{"score": <number between 0 and 1>, "reason": "<brief explana
             from ..utils import extract_json_from_llm_response
             result = extract_json_from_llm_response(response.content, default={})
             score = float(result.get("score", 0.5))
-            logger.info("LLM self-eval score=%.2f reason=%s", score, result.get("reason", ""))
-            return min(1.0, max(0.0, score))
+            reason = str(result.get("reason", "No reason given"))
+            score = min(1.0, max(0.0, score))
+            self._last_eval_reason = reason
+            logger.info("LLM self-eval score=%.2f reason=%s", score, reason)
+            return score
 
         except asyncio.TimeoutError:
             logger.warning("LLM self-eval timed out, falling back to heuristics")
+            self._last_eval_reason = "LLM evaluation timed out"
             return self._heuristic_evaluate(steps)
         except Exception as e:
             logger.warning("LLM self-eval failed: %s, falling back to heuristics", e)
+            self._last_eval_reason = f"LLM evaluation failed: {e}"
             return self._heuristic_evaluate(steps)
 
     def _heuristic_evaluate(self, steps: list[StepLog]) -> float:

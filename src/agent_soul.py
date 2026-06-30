@@ -189,6 +189,18 @@ class AgentSoul:
                 journal_trimmed = "...(earlier entries truncated)...\n\n" + journal_trimmed[-2000:]
             sections.append(journal_trimmed)
 
+        # ── Project documents (Codex-style 4-file system) ──
+        if task_context and "project_docs" in task_context:
+            docs = task_context["project_docs"]
+            if "prompt" in docs:
+                sections.append(f"## Project Spec\n{docs['prompt']}")
+            if "plan" in docs:
+                sections.append(f"## Project Plan\n{docs['plan']}")
+            if "implement" in docs:
+                sections.append(f"## Implementation Guide\n{docs['implement']}")
+            if "documentation" in docs:
+                sections.append(f"## Project Documentation\n{docs['documentation']}")
+
         result = "\n\n---\n\n".join(sections)
 
         # ── Template variable interpolation ──

@@ -110,6 +110,9 @@ class ToolRegistry:
 
     def __init__(self):
         self._tools: dict[str, ToolSpec] = {}
+        self._cache: dict[str, Any] = {}  # cache_key -> {"result": ..., "timestamp": ...}
+        self._cache_enabled: bool = True
+        self._cache_ttl: int = 300  # 5 minutes
 
     # ── Registration ──────────────────────────────────────────────
 
@@ -199,18 +202,72 @@ class ToolRegistry:
 
     # ── Invocation ────────────────────────────────────────────────
 
+    def _cache_key(self, name: str, args: dict) -> str:
+        """Generate a deterministic cache key from tool name and args."""
+        return f"{name}:{json.dumps(args, sort_keys=True)}"
+
+    async def _invoke_with_retry(
+        self, name: str, args: dict,
+        max_retries: int = 3, retry_delay: float = 1.0,
+    ) -> Any:
+        """Call the handler with exponential backoff retry on failure."""
+        import inspect
+
+        spec = self._tools.get(name)
+        if spec is None:
+            raise ValueError(f"Tool not found: {name}")
+
+        last_error: Exception | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                if inspect.iscoroutinefunction(spec.handler):
+                    return await spec.handler(**args)
+                else:
+                    return spec.handler(**args)
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    delay = retry_delay * (2 ** attempt)
+                    logger.warning(
+                        "ToolRegistry: '%s' attempt %d/%d failed (%s), retrying in %.1fs",
+                        name, attempt + 1, max_retries + 1, type(e).__name__, delay,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(
+                        "ToolRegistry: '%s' all %d attempts failed: %s",
+                        name, max_retries + 1, type(e).__name__,
+                    )
+
+        raise last_error  # type: ignore[misc]
+
+    def clear_cache(self) -> None:
+        """Clear all cached tool results."""
+        self._cache.clear()
+
+    def cache_stats(self) -> dict:
+        """Return cache statistics."""
+        return {
+            "size": len(self._cache),
+            "enabled": self._cache_enabled,
+            "ttl": self._cache_ttl,
+        }
+
     async def invoke(self, name: str, args: dict,
                      interaction_hub=None,
                      max_retries: int = 3,
-                     retry_delay: float = 1.0) -> Any:
-        """Invoke a registered tool with automatic retry on failure.
+                     retry_delay: float = 1.0,
+                     use_cache: bool = True) -> Any:
+        """Invoke a registered tool with caching + automatic retry on failure.
 
         Flow:
-          1. Look up tool — raise ValueError if missing or disabled
-          2. Validate args against JSON Schema — raise ValidationError on mismatch
-          3. If risk_level >= threshold and interaction_hub exists → request approval
-          4. Call handler with exponential backoff retry on failure
-          5. Return result
+          1. Check cache (if enabled and use_cache=True)
+          2. Look up tool — raise ValueError if missing or disabled
+          3. Validate args against JSON Schema — raise ValidationError on mismatch
+          4. If risk_level >= threshold and interaction_hub exists → request approval
+          5. Call handler with exponential backoff retry on failure
+          6. Cache result on success
+          7. Return result
 
         Args:
             name: Tool name, e.g. "fs.read_file"
@@ -219,11 +276,23 @@ class ToolRegistry:
             max_retries: Maximum number of retries on failure (default 3)
             retry_delay: Initial delay between retries in seconds (default 1.0),
                 doubles on each subsequent retry (exponential backoff)
+            use_cache: Whether to use the cache (default True)
 
         Returns:
             Whatever the tool handler returns.
         """
-        import inspect
+        import time as _time
+        import inspect as _inspect
+
+        # 0. Cache check
+        if use_cache and self._cache_enabled:
+            key = self._cache_key(name, args)
+            cached = self._cache.get(key)
+            if cached is not None:
+                if _time.time() - cached["timestamp"] < self._cache_ttl:
+                    return cached["result"]
+                else:
+                    del self._cache[key]
 
         spec = self._tools.get(name)
         if spec is None:
@@ -262,30 +331,15 @@ class ToolRegistry:
                         raise
                     logger.warning("ToolRegistry: approval check failed for '%s': %s", name, e)
 
-        # 4. Call handler with exponential backoff retry
-        last_error: Exception | None = None
-        for attempt in range(max_retries + 1):
-            try:
-                if inspect.iscoroutinefunction(spec.handler):
-                    return await spec.handler(**args)
-                else:
-                    return spec.handler(**args)
-            except Exception as e:
-                last_error = e
-                if attempt < max_retries:
-                    delay = retry_delay * (2 ** attempt)
-                    logger.warning(
-                        "ToolRegistry: '%s' attempt %d/%d failed (%s), retrying in %.1fs",
-                        name, attempt + 1, max_retries + 1, type(e).__name__, delay,
-                    )
-                    await asyncio.sleep(delay)
-                else:
-                    logger.error(
-                        "ToolRegistry: '%s' all %d attempts failed: %s",
-                        name, max_retries + 1, type(e).__name__,
-                    )
+        # 4. Execute with retry
+        result = await self._invoke_with_retry(name, args, max_retries, retry_delay)
 
-        raise last_error  # type: ignore[misc]
+        # 5. Cache result
+        if use_cache and self._cache_enabled:
+            key = self._cache_key(name, args)
+            self._cache[key] = {"result": result, "timestamp": _time.time()}
+
+        return result
 
     # ── Bulk helpers ──────────────────────────────────────────────
 
