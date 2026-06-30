@@ -18,10 +18,21 @@ import os
 import sys
 from pathlib import Path
 
+import yaml
+
 logger = logging.getLogger(__name__)
 
 
-def cmd_init_config(args):
+def setup_logging():
+    """Load logging configuration from config/logging.yaml, fallback to basicConfig."""
+    import logging.config
+    config_path = "config/logging.yaml"
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
+        logging.config.dictConfig(config)
+    else:
+        logging.basicConfig(level=logging.INFO)
     """Initialize configuration file."""
     config_path = Path(args.config or "agent-loop.yaml")
     if config_path.exists():
@@ -156,6 +167,7 @@ def cmd_start(args):
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
     async def run():
+        setup_logging()
         from src.memory import MemoryPool
         from src.llm import create_provider
         from src.loop_engine import LoopConfig, AgentLoop
@@ -227,6 +239,14 @@ def cmd_start(args):
             mail_router=mail_router,
             persistence=persistence,
         )
+
+        # Enable AgentForker for parallel task capability
+        try:
+            manager.enable_forker()
+            print("  + AgentForker enabled")
+        except Exception as e:
+            print(f"  + AgentForker skipped: {e}")
+
         print("[6/6] TaskAgent + AgentManagerAgent initialized")
 
         # 7. Show system info

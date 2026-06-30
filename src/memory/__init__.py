@@ -32,11 +32,22 @@ class MemoryPool:
     All agents read/write through this single pool.
     No copies, no sync - shared access through SurrealDB.
 
-    Falls back to in-memory dict when SurrealDB is not connected.
+    Falls back to SQLite or in-memory dict when SurrealDB is not connected.
     """
 
+    _DB_SCHEMA = (
+        "CREATE TABLE IF NOT EXISTS memories ("
+        "  id TEXT PRIMARY KEY,"
+        "  agent_id TEXT,"
+        "  content TEXT,"
+        "  metadata TEXT,"
+        "  created_at REAL"
+        ")"
+    )
+
     def __init__(self, url: str = "ws://127.0.0.1:8000", namespace: str = "agent_loop",
-                 database: str = "memory", user: str = "root", password: str = "root"):
+                 database: str = "memory", user: str = "root", password: str = "root",
+                 db_path: str | None = None):
         self.url = url
         self.namespace = namespace
         self.database = database
@@ -44,6 +55,10 @@ class MemoryPool:
         self._db: Surreal | None = None
         self._embedding_fn: Any = None  # Set via configure_embedding()
         self._mem: dict[str, list[dict]] = {}  # in-memory fallback
+        self._db_path: str | None = db_path
+        self._sqlite: Any = None  # sqlite3.Connection when db_path is set
+        if db_path:
+            self._init_sqlite(db_path)
 
     async def connect(self) -> None:
         """Connect to SurrealDB and initialize schema."""
@@ -57,6 +72,61 @@ class MemoryPool:
         if self._db:
             await self._db.close()
             self._db = None
+        if self._sqlite:
+            self._sqlite.close()
+            self._sqlite = None
+
+    def _init_sqlite(self, db_path: str) -> None:
+        """Initialize SQLite backend and create schema."""
+        import sqlite3
+        self._sqlite = sqlite3.connect(db_path, check_same_thread=False)
+        self._sqlite.execute(self._DB_SCHEMA)
+        self._sqlite.commit()
+        logger.info("MemoryPool: SQLite backend initialized at %s", db_path)
+
+    def _save_to_db(self, key: str, entry: dict) -> None:
+        """Persist a single memory entry to SQLite."""
+        if not self._sqlite:
+            return
+        import json as _json
+        import time
+        self._sqlite.execute(
+            "INSERT OR REPLACE INTO memories (id, agent_id, content, metadata, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                key,
+                entry.get("agent_id", ""),
+                entry.get("content", _json.dumps(entry, default=str)),
+                _json.dumps(entry.get("metadata", {}), default=str),
+                entry.get("created_at", time.time()),
+            ),
+        )
+        self._sqlite.commit()
+
+    def _load_from_db(self) -> dict[str, list[dict]]:
+        """Load all memories from SQLite."""
+        if not self._sqlite:
+            return {}
+        import json as _json
+        rows = self._sqlite.execute("SELECT id, agent_id, content, metadata, created_at FROM memories").fetchall()
+        result: dict[str, list[dict]] = {}
+        for row in rows:
+            entry_id, agent_id, content, metadata, created_at = row
+            try:
+                entry = _json.loads(content)
+            except (json.JSONDecodeError, TypeError):
+                entry = {"content": content}
+            entry["id"] = entry_id
+            entry["agent_id"] = agent_id
+            entry["created_at"] = created_at
+            try:
+                entry["metadata"] = _json.loads(metadata)
+            except (json.JSONDecodeError, TypeError):
+                entry["metadata"] = {}
+            # Group by collection (extracted from id pattern 'collection:N')
+            collection = entry_id.split(":")[0] if ":" in entry_id else "default"
+            result.setdefault(collection, []).append(entry)
+        return result
 
     async def initialize_schema(self) -> None:
         """Load and execute the schema definition."""

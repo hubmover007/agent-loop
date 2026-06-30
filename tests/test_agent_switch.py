@@ -53,6 +53,7 @@ class FakeLoop:
 
 def make_manager(pool):
     """Create an AgentManagerAgent with a pre-populated pool."""
+    import asyncio
     from src.system_agents import AgentManagerAgent, TaskRegistry
 
     registry = TaskRegistry()
@@ -72,6 +73,7 @@ def make_manager(pool):
     manager._event_bus = None
     manager.external_bridge = None
     manager.forker = None
+    manager._lock = asyncio.Lock()
     return manager
 
 

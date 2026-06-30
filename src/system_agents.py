@@ -464,6 +464,9 @@ class AgentManagerAgent:
         # In-flight tracking: task_id → (agent, asyncio.Task)
         self._inflight: dict[str, tuple[Agent, asyncio.Task]] = {}
 
+        # Lock for thread-safe mutation of pool and in-flight state
+        self._lock = asyncio.Lock()
+
     # ── Persistence: startup restore ───────────────────────────────────
 
     async def restore_agents_on_startup(self) -> int:
@@ -513,16 +516,17 @@ class AgentManagerAgent:
 
         Returns True if successfully assigned.
         """
-        if len(self._inflight) >= self.config.max_agent_concurrent:
-            return False
+        async with self._lock:
+            if len(self._inflight) >= self.config.max_agent_concurrent:
+                return False
 
-        # Check if task should go to an external agent
-        external_agent = self._should_use_external(task, prefer_external)
-        if external_agent:
-            return await self._assign_external(task, external_agent)
+            # Check if task should go to an external agent
+            external_agent = self._should_use_external(task, prefer_external)
+            if external_agent:
+                return await self._assign_external(task, external_agent)
 
-        # Use internal worker agent
-        return await self._assign_internal(task)
+            # Use internal worker agent
+            return await self._assign_internal(task)
 
     def _should_use_external(self, task: ManagedTask,
                              prefer_external: bool) -> str | None:
@@ -1071,13 +1075,14 @@ class AgentManagerAgent:
           2. Move state/agents/{id}/ → trash/agents/{id}/
           3. Write destroyed_at + destroy_reason to meta.json
         """
-        agent_id = agent.agent_id
+        async with self._lock:
+            agent_id = agent.agent_id
 
-        # Remove from pool
-        self.pool.agents.pop(agent_id, None)
-        agent.status = AgentStatus.DESTROYED
+            # Remove from pool
+            self.pool.agents.pop(agent_id, None)
+            agent.status = AgentStatus.DESTROYED
 
-        # Move files to trash
+        # Move files to trash (I/O outside lock)
         state_dir = Path("state/agents") / agent_id
         trash_dir = Path("trash/agents") / agent_id
 
@@ -1127,16 +1132,17 @@ class AgentManagerAgent:
 
     async def cancel(self, task_id: str) -> None:
         """Cancel a task and destroy its agent."""
-        pair = self._inflight.pop(task_id, None)
-        if pair:
-            agent, asyncio_task = pair
-            asyncio_task.cancel()
-            await self.pool.destroy(agent.agent_id)
+        async with self._lock:
+            pair = self._inflight.pop(task_id, None)
+            if pair:
+                agent, asyncio_task = pair
+                asyncio_task.cancel()
+                await self.pool.destroy(agent.agent_id)
 
-        task = self.registry.get(task_id)
-        if task:
-            task.status = TaskStatus.CANCELLED
-            task.completed_at = datetime.now(timezone.utc)
+            task = self.registry.get(task_id)
+            if task:
+                task.status = TaskStatus.CANCELLED
+                task.completed_at = datetime.now(timezone.utc)
 
     def stats(self) -> dict:
         pool_stats = self.pool.stats()
@@ -1196,13 +1202,14 @@ class AgentManagerAgent:
 
         Returns True on success, False if target agent not found.
         """
-        agent = self.pool.agents.get(agent_id)
-        if not agent:
-            logger.warning("AgentManager: switch_agent failed — '%s' not found", agent_id)
-            return False
+        async with self._lock:
+            agent = self.pool.agents.get(agent_id)
+            if not agent:
+                logger.warning("AgentManager: switch_agent failed — '%s' not found", agent_id)
+                return False
 
-        # Save current active agent context
-        current = self.get_active_agent()
+            # Save current active agent context
+            current = self.get_active_agent()
         session_path = Path("state/session.json")
         session_data = {}
         if session_path.exists():
@@ -1269,9 +1276,11 @@ class AgentManagerAgent:
         )
 
         child_id = await self.forker.fork(config)
-        task.assigned_agent_id = child_id
-        task.status = TaskStatus.RUNNING
-        task.started_at = datetime.now(timezone.utc)
+
+        async with self._lock:
+            task.assigned_agent_id = child_id
+            task.status = TaskStatus.RUNNING
+            task.started_at = datetime.now(timezone.utc)
 
         logger.info("AgentManagerAgent: forked %s → %s for task %s (reason: %s)",
                     parent_id, child_id, task.task_id, fork_reason)

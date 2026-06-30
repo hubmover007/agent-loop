@@ -1,0 +1,32 @@
+version: 1
+disable_existing_loggers: false
+formatters:
+  default:
+    format: '%(asctime)s [%(name)s] %(levelname)s: %(message)s'
+  compact:
+    format: '%(levelname)s %(name)s: %(message)s'
+handlers:
+  console:
+    class: logging.StreamHandler
+    level: INFO
+    formatter: default
+    stream: ext://sys.stdout
+  file:
+    class: logging.handlers.RotatingFileHandler
+    level: DEBUG
+    formatter: default
+    filename: logs/agent-loop.log
+    maxBytes: 10485760
+    backupCount: 5
+loggers:
+  agent_loop:
+    level: DEBUG
+    handlers: [console, file]
+    propagate: no
+  src:
+    level: DEBUG
+    handlers: [console, file]
+    propagate: no
+root:
+  level: WARNING
+  handlers: [console]
