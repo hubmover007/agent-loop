@@ -317,6 +317,13 @@ class MemoryPool:
                 docs[meta["doc_type"]] = m.get("content", "")
         return docs
 
+    def clear(self) -> None:
+        """Clear all in-memory data (for testing)."""
+        self._mem.clear()
+        if self._sqlite:
+            self._sqlite.execute("DELETE FROM memories")
+            self._sqlite.commit()
+
     async def write_fact(self, fact_type: str, name: str, value: Any = None,
                          embedding_text: str | None = None) -> str:
         """Write a Fact (entity or facetpoint) to Layer 0."""
