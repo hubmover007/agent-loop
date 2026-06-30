@@ -416,7 +416,8 @@ class AgentManagerAgent:
                  state_store: Any | None = None,
                  template_registry: AgentTemplateRegistry | None = None,
                  interaction_hub: Any | None = None,
-                 mail_router: Any | None = None):
+                 mail_router: Any | None = None,
+                 persistence: Any | None = None):
         self.memory = memory
         self.agent_loop = agent_loop
         self.config = config
@@ -433,6 +434,9 @@ class AgentManagerAgent:
 
         # Agent-to-Agent MailRouter — single instance for all agents
         self.mail_router = mail_router
+
+        # PersistenceManager — cross-session state persistence
+        self.persistence = persistence
 
         # Agent template registry — JSON/YAML driven, no free-form LLM selection
         self.template_registry = template_registry or AgentTemplateRegistry()
@@ -453,6 +457,40 @@ class AgentManagerAgent:
 
         # In-flight tracking: task_id → (agent, asyncio.Task)
         self._inflight: dict[str, tuple[Agent, asyncio.Task]] = {}
+
+    # ── Persistence: startup restore ───────────────────────────────────
+
+    async def restore_agents_on_startup(self) -> int:
+        """Restore agent states from snapshots on system startup.
+
+        Scans all snapshot directories and restores each agent's state
+        from the latest snapshot. Returns the number of agents restored.
+        """
+        if not self.persistence:
+            logger.debug("AgentManager: no PersistenceManager, skipping restore")
+            return 0
+
+        restored = 0
+        snap_base = self.persistence.snapshot_dir
+        if not snap_base.exists():
+            return 0
+
+        for agent_dir in snap_base.iterdir():
+            if not agent_dir.is_dir():
+                continue
+            agent_id = agent_dir.name
+            try:
+                success = await self.persistence.restore(agent_id)
+                if success:
+                    logger.info("AgentManager: restored agent '%s' from snapshot", agent_id)
+                    restored += 1
+            except Exception as e:
+                logger.warning("AgentManager: failed to restore '%s': %s", agent_id, e)
+
+        logger.info("AgentManager: restored %d agents on startup", restored)
+        return restored
+
+    # ── Assignment ──────────────────────────────────────────────────────
 
     async def assign(self, task: ManagedTask,
                      prefer_external: bool = False) -> bool:
@@ -746,6 +784,12 @@ class AgentManagerAgent:
 
         finally:
             await branch.cleanup()
+            # Snapshot agent state for cross-session persistence
+            if self.persistence:
+                try:
+                    await self.persistence.snapshot(agent.agent_id)
+                except Exception as e:
+                    logger.warning("AgentManager: persistence.snapshot failed: %s", e)
             # Release agent back to pool if not destroyed
             if agent.agent_id in self.pool.agents:
                 await self.pool.release(agent.agent_id)

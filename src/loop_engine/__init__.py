@@ -187,7 +187,9 @@ class AgentLoop:
                  interaction_hub: Any | None = None,
                  mailbox: Any | None = None,
                  evolution: Any | None = None,
-                 emitter: Any | None = None):
+                 emitter: Any | None = None,
+                 tool_registry: Any | None = None,
+                 multimodal_processor: Any | None = None):
         self.tool_loop = tool_loop
         self.llm = llm
         self.config = config
@@ -196,23 +198,38 @@ class AgentLoop:
         self.mailbox = mailbox  # Optional AgentMailbox for inter-agent comms
         self.evolution = evolution  # Optional EvolutionEngine for structured EVOLVE
         self.emitter = emitter  # Optional ProgressEmitter for streaming
+        self.tool_registry = tool_registry  # Optional MCP ToolRegistry
+        self.multimodal_processor = multimodal_processor  # Optional MultimodalProcessor
 
     async def run(self, agent_id: str, task_scope: str, context: dict,
-                  allowed_tools: list[str]) -> TaskResult:
+                  allowed_tools: list[str],
+                  multimodal_inputs: list | None = None) -> TaskResult:
         """Execute AgentLoop: PLAN → EXECUTE → SELF_EVAL → EVOLVE → SUBMIT.
 
         Phases:
           1. PLAN — generate execution steps
-          2. EXECUTE — run steps with tool calls
+          2. EXECUTE — run steps with tool calls (via tool_registry if available)
           3. SELF_EVAL — LLM self-evaluation
           4. EVOLVE — write JOURNAL.md + update profile.json (if score >= threshold)
           5. SUBMIT — return result (or self-destruct on failure)
+
+        If multimodal_inputs is provided and multimodal_processor is set,
+        media inputs are processed into content blocks attached to context.
 
         This runs within an isolated BranchSpace.
         """
         steps: list[StepLog] = []
         artifacts: dict = {}
         started_at = datetime.now(timezone.utc)
+
+        # ── Multimodal input processing ──────────────────────────
+        if multimodal_inputs and self.multimodal_processor:
+            try:
+                blocks = await self.multimodal_processor.process(multimodal_inputs)
+                context["multimodal_blocks"] = blocks
+                logger.info("AgentLoop[%s]: processed %d multimodal blocks", agent_id, len(blocks))
+            except Exception as e:
+                logger.warning("AgentLoop[%s]: multimodal processing failed: %s", agent_id, e)
 
         logger.info("AgentLoop[%s] started: %s", agent_id, task_scope[:50])
 
@@ -241,7 +258,12 @@ class AgentLoop:
 
                 # Check if this step requires a tool call
                 tool_name = action.get("tool")
-                if tool_name and tool_name in allowed_tools:
+                # Allow tool if: (1) in allowed_tools list, OR (2) registered in tool_registry
+                tool_allowed = (tool_name in allowed_tools) if allowed_tools else True
+                if not tool_allowed and self.tool_registry is not None:
+                    spec = self.tool_registry.get(tool_name)
+                    tool_allowed = spec is not None and spec.enabled
+                if tool_name and tool_allowed:
                     # ── Human-in-the-Loop: check high-risk operations ─────
                     if self.interaction_hub is not None:
                         from ..interaction import detect_risk_level, RISK_LEVEL_ORDER
