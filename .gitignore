@@ -10,3 +10,5 @@ venv/
 data/
 *.db
 .DS_Store
+state/agents/
+state/cost.json

@@ -1,8 +1,0 @@
-{
-  "agent_id": "agent:90bc74c3",
-  "created_at": "2026-06-30T11:03:52.362934+00:00",
-  "total_tasks": 0,
-  "success_rate": 0.0,
-  "personality": "executor",
-  "role": "coder"
-}
