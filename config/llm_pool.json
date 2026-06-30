@@ -1,0 +1,63 @@
+{
+  "providers": [
+    {
+      "id": "deepseek-chat",
+      "type": "openai",
+      "endpoint": "https://api.deepseek.com/v1",
+      "model": "deepseek-chat",
+      "api_key_source": "env:DEEPSEEK_API_KEY",
+      "capabilities": ["general", "coding", "reasoning"],
+      "cost_per_1m_input": 0.14,
+      "cost_per_1m_output": 0.28,
+      "max_concurrent": 10,
+      "verified": false,
+      "verified_at": null,
+      "enabled": true,
+      "tags": ["cheap", "production"]
+    },
+    {
+      "id": "deepseek-reasoner",
+      "type": "openai",
+      "endpoint": "https://api.deepseek.com/v1",
+      "model": "deepseek-reasoner",
+      "api_key_source": "env:DEEPSEEK_API_KEY",
+      "capabilities": ["reasoning", "math", "analysis", "coding"],
+      "cost_per_1m_input": 0.55,
+      "cost_per_1m_output": 2.19,
+      "max_concurrent": 5,
+      "verified": false,
+      "verified_at": null,
+      "enabled": true,
+      "tags": ["reasoning", "production"]
+    },
+    {
+      "id": "glm-local",
+      "type": "openai",
+      "endpoint": "http://localhost:8000/v1",
+      "model": "GLM-5.2",
+      "api_key_source": "none",
+      "capabilities": ["general", "coding"],
+      "cost_per_1m_input": 0.0,
+      "cost_per_1m_output": 0.0,
+      "max_concurrent": 2,
+      "verified": false,
+      "verified_at": null,
+      "enabled": false,
+      "tags": ["local", "free"]
+    }
+  ],
+  "selection": {
+    "default_strategy": "balanced",
+    "task_mapping": {
+      "reasoning": "most_capable",
+      "coding": "cheapest",
+      "quick": "cheapest",
+      "general": "balanced"
+    },
+    "strategies": {
+      "cheapest": {"sort_by": "cost_per_1m_input", "ascending": true},
+      "most_capable": {"sort_by": "cost_per_1m_input", "ascending": false},
+      "balanced": {"weights": {"cost": 0.5, "capability_match": 0.5}}
+    }
+  }
+}

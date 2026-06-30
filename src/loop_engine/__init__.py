@@ -182,14 +182,23 @@ class ToolLoop:
 class AgentLoop:
     """Level 2: Individual agent execution loop."""
 
-    def __init__(self, tool_loop: ToolLoop, llm: LLMProvider, config: LoopConfig):
+    def __init__(self, tool_loop: ToolLoop, llm: LLMProvider, config: LoopConfig,
+                 agent_soul: Any | None = None):
         self.tool_loop = tool_loop
         self.llm = llm
         self.config = config
+        self.agent_soul = agent_soul  # Optional AgentSoul for EVOLVE
 
     async def run(self, agent_id: str, task_scope: str, context: dict,
                   allowed_tools: list[str]) -> TaskResult:
-        """Execute AgentLoop: PLAN → EXECUTE → SELF_EVAL → SUBMIT.
+        """Execute AgentLoop: PLAN → EXECUTE → SELF_EVAL → EVOLVE → SUBMIT.
+
+        Phases:
+          1. PLAN — generate execution steps
+          2. EXECUTE — run steps with tool calls
+          3. SELF_EVAL — LLM self-evaluation
+          4. EVOLVE — write JOURNAL.md + update profile.json (if score >= threshold)
+          5. SUBMIT — return result (or self-destruct on failure)
 
         This runs within an isolated BranchSpace.
         """
@@ -254,7 +263,31 @@ class AgentLoop:
             # Phase 3: SELF_EVAL
             eval_result = await self._self_evaluate(task_scope, steps, artifacts)
 
-            # Phase 4: SUBMIT (or self-destruct)
+            # Phase 4: EVOLVE — write JOURNAL.md + update profile.json
+            if eval_result >= self.config.accept_threshold and self.agent_soul:
+                try:
+                    await self.agent_soul.evolve(
+                        f"Completed: {task_scope}. Score: {eval_result:.2f}"
+                    )
+                    # Reward: increase efficiency on success
+                    await self.agent_soul.update_identity_trait("efficiency", +0.02)
+                    await self.agent_soul.record_task(success=True)
+                    logger.debug("AgentLoop[%s]: EVOLVE — soul updated", agent_id)
+                except Exception as ev:
+                    logger.warning("AgentLoop[%s]: EVOLVE failed: %s", agent_id, ev)
+            elif self.agent_soul:
+                # Record failure for learning
+                try:
+                    await self.agent_soul.evolve(
+                        f"Failed: {task_scope}. Score: {eval_result:.2f}"
+                    )
+                    # Punish: decrease efficiency on failure
+                    await self.agent_soul.update_identity_trait("efficiency", -0.05)
+                    await self.agent_soul.record_task(success=False)
+                except Exception as ev:
+                    logger.warning("AgentLoop[%s]: EVOLVE failed: %s", agent_id, ev)
+
+            # Phase 5: SUBMIT (or self-destruct)
             if eval_result >= self.config.accept_threshold:
                 status = TaskStatus.DONE
                 summary = await self._generate_summary(task_scope, steps, artifacts)

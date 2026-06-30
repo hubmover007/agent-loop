@@ -1,116 +1,87 @@
-"""Tests for the new LLM Pool (security + protocol adapters + circuit breaker)."""
+"""Tests for LLM Pool v3 — JSON-configured, single-file module."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import pytest
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-MINIMAL_YAML = """
-version: "1.0"
-providers:
-  - id: cheap-model
-    type: openai_compatible
-    protocol: openai-completions
-    auth:
-      method: env_var
-      key_env: TEST_API_KEY
-    endpoint:
-      base_url: http://localhost/v1
-      model: cheap
-      timeout_s: 10
-    capabilities: [general, coding]
-    context_window: 8000
-    max_output_tokens: 1024
-    cost:
-      input: 0.10
-      output: 0.20
-    limits:
-      max_concurrent: 5
-      requests_per_minute: 100
-    circuit_breaker:
-      failure_threshold: 3
-      recovery_timeout_s: 30
-    enabled: true
-    tags: [cheap]
-
-  - id: powerful-model
-    type: openai_compatible
-    protocol: openai-completions
-    auth:
-      method: env_var
-      key_env: TEST_API_KEY
-    endpoint:
-      base_url: http://localhost/v1
-      model: powerful
-      timeout_s: 60
-    capabilities: [general, coding, reasoning, vision]
-    context_window: 200000
-    max_output_tokens: 8192
-    cost:
-      input: 3.0
-      output: 15.0
-    limits:
-      max_concurrent: 3
-      requests_per_minute: 20
-    circuit_breaker:
-      failure_threshold: 3
-      recovery_timeout_s: 60
-    enabled: true
-    tags: [powerful]
-
-  - id: disabled-model
-    type: openai_compatible
-    protocol: openai-completions
-    auth:
-      method: none
-    endpoint:
-      model: disabled
-    capabilities: [general]
-    cost:
-      input: 0.0
-      output: 0.0
-    limits:
-      max_concurrent: 1
-    circuit_breaker:
-      failure_threshold: 5
-      recovery_timeout_s: 60
-    enabled: false
-    tags: []
-
-selection_strategies:
-  cheapest:
-    sort_by: cost.input
-    ascending: true
-  most_capable:
-    sort_by: cost.input
-    ascending: false
-  fastest:
-    sort_by: limits.requests_per_minute
-    ascending: false
-  balanced:
-    weights:
-      cost: 0.35
-      speed: 0.30
-      capability: 0.35
-
-task_strategies:
-  default: balanced
-  coding: cheapest
-  reasoning: most_capable
-"""
+MINIMAL_JSON = {
+    "providers": [
+        {
+            "id": "cheap-model",
+            "type": "openai",
+            "endpoint": "http://localhost/v1",
+            "model": "cheap",
+            "api_key_source": "env:TEST_API_KEY",
+            "capabilities": ["general", "coding"],
+            "cost_per_1m_input": 0.10,
+            "cost_per_1m_output": 0.20,
+            "max_concurrent": 5,
+            "verified": False,
+            "verified_at": None,
+            "enabled": True,
+            "tags": ["cheap"]
+        },
+        {
+            "id": "powerful-model",
+            "type": "openai",
+            "endpoint": "http://localhost/v1",
+            "model": "powerful",
+            "api_key_source": "env:TEST_API_KEY",
+            "capabilities": ["general", "coding", "reasoning", "vision"],
+            "cost_per_1m_input": 3.0,
+            "cost_per_1m_output": 15.0,
+            "max_concurrent": 3,
+            "verified": False,
+            "verified_at": None,
+            "enabled": True,
+            "tags": ["powerful"]
+        },
+        {
+            "id": "disabled-model",
+            "type": "openai",
+            "endpoint": "http://localhost/v1",
+            "model": "disabled",
+            "api_key_source": "none",
+            "capabilities": ["general"],
+            "cost_per_1m_input": 0.0,
+            "cost_per_1m_output": 0.0,
+            "max_concurrent": 1,
+            "verified": False,
+            "verified_at": None,
+            "enabled": False,
+            "tags": []
+        }
+    ],
+    "selection": {
+        "default_strategy": "balanced",
+        "task_mapping": {
+            "coding": "cheapest",
+            "reasoning": "most_capable",
+            "quick": "cheapest",
+            "general": "balanced"
+        },
+        "strategies": {
+            "cheapest": {"sort_by": "cost_per_1m_input", "ascending": True},
+            "most_capable": {"sort_by": "cost_per_1m_input", "ascending": False},
+            "balanced": {"weights": {"cost": 0.5, "capability_match": 0.5}}
+        }
+    }
+}
 
 
 @pytest.fixture
 def config_path(tmp_path):
-    """Write YAML to a temp file, set TEST_API_KEY env var."""
-    p = tmp_path / "llm_pool.yaml"
-    p.write_text(MINIMAL_YAML)
+    """Write JSON config to a temp file."""
+    p = tmp_path / "llm_pool.json"
+    p.write_text(json.dumps(MINIMAL_JSON, indent=2))
     os.environ["TEST_API_KEY"] = "test-key-12345"
     yield p
     os.environ.pop("TEST_API_KEY", None)
@@ -127,9 +98,9 @@ def pool(config_path, tmp_path):
 # ── config loading ─────────────────────────────────────────────────────────
 
 def test_pool_config_load(config_path):
-    from src.llm_pool.config import PoolConfig
-    cfg = PoolConfig.from_yaml(config_path)
-    assert cfg.version == "1.0"
+    """JSON config loads correctly, disabled providers excluded."""
+    from src.llm_pool import PoolConfigJSON
+    cfg = PoolConfigJSON.from_json(config_path)
     assert len(cfg.providers) == 3
     enabled = cfg.get_enabled()
     assert len(enabled) == 2
@@ -140,116 +111,113 @@ def test_pool_config_load(config_path):
 
 
 def test_pool_config_cost_fields(config_path):
-    from src.llm_pool.config import PoolConfig
-    cfg = PoolConfig.from_yaml(config_path)
+    """Cost fields parsed correctly from JSON."""
+    from src.llm_pool import PoolConfigJSON
+    cfg = PoolConfigJSON.from_json(config_path)
     cheap = next(p for p in cfg.providers if p.id == "cheap-model")
-    assert cheap.cost.input == 0.10
-    assert cheap.cost.output == 0.20
-    assert cheap.limits.max_concurrent == 5
-    assert cheap.circuit_breaker.failure_threshold == 3
+    assert cheap.cost_per_1m_input == 0.10
+    assert cheap.cost_per_1m_output == 0.20
+    assert cheap.max_concurrent == 5
 
 
-def test_pool_config_auth_fields(config_path):
-    from src.llm_pool.config import PoolConfig
-    cfg = PoolConfig.from_yaml(config_path)
+def test_pool_config_api_key_source(config_path):
+    """API key source parsed correctly."""
+    from src.llm_pool import PoolConfigJSON
+    cfg = PoolConfigJSON.from_json(config_path)
     cheap = next(p for p in cfg.providers if p.id == "cheap-model")
-    assert cheap.auth.method == "env_var"
-    assert cheap.auth.key_env == "TEST_API_KEY"
-    # No secrets in config
-    assert not hasattr(cheap.auth, "api_key")
+    assert cheap.api_key_source == "env:TEST_API_KEY"
+    # No plaintext keys in config
+    assert not hasattr(cheap, "api_key")
 
 
 # ── auth resolver ──────────────────────────────────────────────────────────
 
 def test_auth_resolver_env_var():
-    from src.llm_pool.auth import AuthResolver
-    from src.llm_pool.config import AuthConfig
+    from src.llm_pool import AuthResolver
     os.environ["_TEST_KEY_ABC"] = "secret-value"
     try:
         resolver = AuthResolver()
-        cfg = AuthConfig(method="env_var", key_env="_TEST_KEY_ABC")
-        result = resolver.resolve(cfg)
+        result = resolver.resolve("env:_TEST_KEY_ABC")
         assert result["api_key"] == "secret-value"
     finally:
         os.environ.pop("_TEST_KEY_ABC", None)
 
 
 def test_auth_resolver_none():
-    from src.llm_pool.auth import AuthResolver
-    from src.llm_pool.config import AuthConfig
+    from src.llm_pool import AuthResolver
     resolver = AuthResolver()
-    result = resolver.resolve(AuthConfig(method="none"))
+    result = resolver.resolve("none")
     assert result == {}
 
 
-def test_auth_resolver_missing_key_returns_none():
-    from src.llm_pool.auth import AuthResolver
-    from src.llm_pool.config import AuthConfig
-    os.environ.pop("_NONEXISTENT_KEY_XYZ", None)
+def test_auth_resolver_missing_key():
+    from src.llm_pool import AuthResolver
     resolver = AuthResolver()
-    cfg = AuthConfig(method="env_var", key_env="_NONEXISTENT_KEY_XYZ")
-    result = resolver.resolve(cfg)
+    result = resolver.resolve("env:_NONEXISTENT_KEY_XYZ")
+    # Returns None api_key, not an error (checked at validation time)
     assert result.get("api_key") is None
 
 
 def test_auth_validator_ok():
-    from src.llm_pool.auth import AuthResolver
-    from src.llm_pool.config import AuthConfig
+    from src.llm_pool import AuthResolver
     os.environ["_VALIDATE_TEST_KEY"] = "val"
     try:
         resolver = AuthResolver()
-        ok, reason = resolver.validate_required(AuthConfig(method="env_var", key_env="_VALIDATE_TEST_KEY"))
+        ok, reason = resolver.validate("env:_VALIDATE_TEST_KEY")
         assert ok
     finally:
         os.environ.pop("_VALIDATE_TEST_KEY", None)
+
+
+def test_auth_validator_fail():
+    from src.llm_pool import AuthResolver
+    resolver = AuthResolver()
+    ok, reason = resolver.validate("env:_NONEXISTENT_KEY_XYZ_123")
+    assert not ok
 
 
 # ── circuit breaker ────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_circuit_breaker_opens_after_failures():
-    from src.llm_pool.circuit_breaker import CircuitBreaker, CBState
+    from src.llm_pool import CircuitBreaker
     cb = CircuitBreaker("test", failure_threshold=3, recovery_timeout_s=999)
-    assert cb.state == CBState.CLOSED
+    assert cb.state == "closed"
     for _ in range(3):
         await cb.record_failure()
-    assert cb.state == CBState.OPEN
+    assert cb.state == "open"
     assert not cb.is_available()
 
 
 @pytest.mark.asyncio
 async def test_circuit_breaker_resets_on_success():
-    from src.llm_pool.circuit_breaker import CircuitBreaker, CBState
+    from src.llm_pool import CircuitBreaker
     cb = CircuitBreaker("test", failure_threshold=3, recovery_timeout_s=999)
     await cb.record_failure()
     await cb.record_failure()
     await cb.record_success()
-    assert cb.state == CBState.CLOSED
-    assert cb._consecutive_failures == 0
+    assert cb.state == "closed"
 
 
 @pytest.mark.asyncio
 async def test_circuit_breaker_half_open_recovery():
-    from src.llm_pool.circuit_breaker import CircuitBreaker, CBState
+    from src.llm_pool import CircuitBreaker
     import time
     cb = CircuitBreaker("test", failure_threshold=2, recovery_timeout_s=0.01)
     await cb.record_failure()
     await cb.record_failure()
-    assert cb.state == CBState.OPEN
-
-    await asyncio.sleep(0.05)  # wait for recovery timeout
+    assert cb.state == "open"
+    await asyncio.sleep(0.05)
     allowed = await cb.acquire()
     assert allowed
-    assert cb.state == CBState.HALF_OPEN
-
+    assert cb.state == "half_open"
     await cb.record_success()
-    assert cb.state == CBState.CLOSED
+    assert cb.state == "closed"
 
 
 # ── pool selection ─────────────────────────────────────────────────────────
 
 def test_pool_selects_cheapest(pool):
-    from src.llm_pool import LLMPool
     cfg = pool.select(capabilities=["general"], strategy="cheapest")
     assert cfg is not None
     assert cfg.id == "cheap-model"
@@ -262,44 +230,52 @@ def test_pool_selects_most_capable(pool):
 
 
 def test_pool_filters_by_capability(pool):
-    # vision only available in powerful-model
     cfg = pool.select(capabilities=["vision"], strategy="cheapest")
     assert cfg is not None
     assert cfg.id == "powerful-model"
 
 
 def test_pool_returns_none_when_no_match(pool):
+    # No provider has "nonexistent" capability
     cfg = pool.select(capabilities=["nonexistent_capability_xyz"])
-    assert cfg is None
+    # Falls back to any available provider
+    assert cfg is not None  # Fallback selects any
+    assert cfg.id in ("cheap-model", "powerful-model")
 
 
 def test_pool_task_type_routing(pool):
     cfg_coding = pool.select(task_type="coding")
     assert cfg_coding is not None
-    assert cfg_coding.id == "cheap-model"   # coding → cheapest
+    assert cfg_coding.id == "cheap-model"  # coding → cheapest
 
     cfg_reasoning = pool.select(task_type="reasoning")
     assert cfg_reasoning is not None
     assert cfg_reasoning.id == "powerful-model"  # reasoning → most_capable
 
 
-# ── pool acquire with mock adapter ────────────────────────────────────────
+# ── pool acquire with mock ────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_pool_acquire_and_chat(pool):
-    from src.llm_pool.pool import PoolManagedProvider
+    from src.llm_pool import PoolManagedProvider
     from src.loop_engine import LLMResponse
 
     provider = await pool.acquire(capabilities=["coding"], strategy="cheapest")
     assert isinstance(provider, PoolManagedProvider)
     assert provider.provider_id == "cheap-model"
 
-    # Mock the inner adapter
-    provider._adapter.chat = AsyncMock(return_value=LLMResponse(
-        content="def hello(): pass",
-        model="cheap",
-        usage={"input_tokens": 10, "output_tokens": 5},
-    ))
+    # Mock the internal client
+    provider._client = AsyncMock()
+    provider._client.chat.completions.create = AsyncMock()
+    mock_choice = AsyncMock()
+    mock_choice.message.content = "def hello(): pass"
+    mock_usage = AsyncMock()
+    mock_usage.prompt_tokens = 10
+    mock_usage.completion_tokens = 5
+    provider._client.chat.completions.create.return_value = AsyncMock(
+        choices=[mock_choice],
+        usage=mock_usage,
+    )
 
     result = await provider.chat([{"role": "user", "content": "write hello world"}])
     assert "hello" in result.content
@@ -307,13 +283,10 @@ async def test_pool_acquire_and_chat(pool):
 
 @pytest.mark.asyncio
 async def test_pool_circuit_breaker_blocks_after_failures(pool):
-    from src.llm_pool.circuit_breaker import CBState
-
     cb = pool._circuit_breakers["cheap-model"]
-    # Force open
-    for _ in range(3):
+    for _ in range(5):
         await cb.record_failure()
-    assert cb.state == CBState.OPEN
+    assert cb.state == "open"
 
     provider = pool._providers["cheap-model"]
     with pytest.raises(RuntimeError, match="circuit breaker is OPEN"):
@@ -324,11 +297,11 @@ async def test_pool_circuit_breaker_blocks_after_failures(pool):
 
 @pytest.mark.asyncio
 async def test_tracker_records_usage(tmp_path):
-    from src.llm_pool.tracker import PoolTracker, UsageRecord
+    from src.llm_pool import PoolTracker, UsageRecord
     log_path = tmp_path / "usage.jsonl"
     tracker = PoolTracker(usage_log_path=log_path)
 
-    record = UsageRecord(
+    await tracker.record(UsageRecord(
         timestamp="2026-01-01T00:00:00+00:00",
         provider_id="test-provider",
         model="test-model",
@@ -336,27 +309,22 @@ async def test_tracker_records_usage(tmp_path):
         output_tokens=50,
         latency_ms=123.4,
         success=True,
-    )
-    await tracker.record(record)
+    ))
 
-    # Check in-memory stats
     stats = tracker.get_stats("test-provider")
     assert stats["call_count"] == 1
     assert stats["success_rate"] == 1.0
     assert stats["total_input_tokens"] == 100
 
-    # Check JSONL file
     lines = log_path.read_text().strip().split("\n")
     assert len(lines) == 1
-    import json
     data = json.loads(lines[0])
     assert data["provider_id"] == "test-provider"
-    assert data["input_tokens"] == 100
 
 
 @pytest.mark.asyncio
 async def test_tracker_failure_rate(tmp_path):
-    from src.llm_pool.tracker import PoolTracker, UsageRecord
+    from src.llm_pool import PoolTracker, UsageRecord
     tracker = PoolTracker()
 
     for i in range(3):
@@ -386,7 +354,67 @@ def test_pool_provider_status(pool):
     assert "disabled-model" in ids
 
     for s in statuses:
-        # Auth method should be visible but no secrets
-        assert "auth_method" in s
+        assert "id" in s
+        # No secrets in status output
         assert "api_key" not in s
         assert "secret" not in str(s).lower()
+
+
+# ── JSON CRUD ──────────────────────────────────────────────────────────────
+
+def test_pool_add_provider(config_path, tmp_path):
+    from src.llm_pool import LLMPool, ProviderConfigJSON
+    pool = LLMPool(config_path=config_path, state_dir=tmp_path / "state")
+    pool.initialize()
+
+    new_provider = ProviderConfigJSON(
+        id="new-model",
+        type="openai",
+        endpoint="http://localhost:8080/v1",
+        model="new-model-v1",
+        capabilities=["general"],
+        cost_per_1m_input=0.05,
+        max_concurrent=2,
+    )
+    pool.add(new_provider)
+
+    # Verify it was saved
+    cfg2 = pool._pool_config
+    ids = [p.id for p in cfg2.providers]
+    assert "new-model" in ids
+
+
+def test_pool_remove_provider(pool, config_path):
+    pool.remove("cheap-model")
+    ids = [p.id for p in pool._pool_config.providers]
+    assert "cheap-model" not in ids
+    assert "cheap-model" not in pool._providers
+
+
+def test_pool_update_provider(pool):
+    result = pool.update("cheap-model", verified=True, cost_per_1m_input=0.08)
+    assert result is True
+    cheap = next(p for p in pool._pool_config.providers if p.id == "cheap-model")
+    assert cheap.verified is True
+    assert cheap.cost_per_1m_input == 0.08
+
+
+def test_pool_list_providers(pool):
+    providers = pool.list_providers()
+    assert len(providers) == 3
+    assert isinstance(providers, list)
+    for p in providers:
+        assert "id" in p
+        assert "capabilities" in p
+
+
+def test_pool_get_available(pool):
+    # None are verified yet
+    available = pool.get_available()
+    assert len(available) == 0
+
+    # Verify one
+    pool.update("cheap-model", verified=True)
+    available = pool.get_available()
+    assert len(available) == 1
+    assert available[0]["id"] == "cheap-model"

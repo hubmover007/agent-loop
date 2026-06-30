@@ -35,6 +35,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import shutil
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -49,6 +51,7 @@ from .core import (
     StepLog, AgentRole, LoopPhase,
 )
 from .agent import Agent, AgentPool, AgentEvaluator
+from .agent_soul import AgentSoul, SoulBuilder
 from .loop_engine import LLMProvider, LLMResponse, LoopConfig, AgentLoop
 from .task import BranchSpace
 from .external_agents import ExternalAgentBridge, KNOWN_AGENTS
@@ -826,6 +829,81 @@ class AgentManagerAgent:
                         agent_type, e)
         finally:
             self._inflight.pop(task.task_id, None)
+
+    # ── Persistent Agent lifecycle ────────────────────────────────────
+
+    async def create_persistent_agent(self, name: str, personality: str = "executor",
+                                      role: str = "coder") -> tuple[Agent, AgentSoul]:
+        """Create a persistent Agent — not destroyed, continuously evolves.
+
+        Args:
+            name: Human-readable agent name
+            personality: Personality card (executor/analyst/creative/guardian)
+            role: Role card (coder/researcher/ops)
+
+        Returns (agent, soul) tuple.
+        """
+        agent = Agent(agent_id=f"agent:persistent:{name}")
+        agent.role = AgentRole.WORKER
+        agent.status = AgentStatus.IDLE
+
+        # Build AgentSoul with personality + role cards
+        soul = SoulBuilder(agent_id=agent.agent_id)\
+            .with_personality(personality)\
+            .with_role(role)\
+            .build()
+
+        # Store the soul reference on the agent
+        agent._soul = soul
+
+        # Add to pool
+        self.pool.agents[agent.agent_id] = agent
+
+        logger.info("AgentManager: created persistent agent '%s' (%s/%s)",
+                    name, personality, role)
+        return agent, soul
+
+    async def destroy_agent(self, agent: Agent, reason: str = "manual") -> None:
+        """Destroy an agent → move private files to trash/ → record reason.
+
+        Steps:
+          1. Remove from pool
+          2. Move state/agents/{id}/ → trash/agents/{id}/
+          3. Write destroyed_at + destroy_reason to meta.json
+        """
+        agent_id = agent.agent_id
+
+        # Remove from pool
+        self.pool.agents.pop(agent_id, None)
+        agent.status = AgentStatus.DESTROYED
+
+        # Move files to trash
+        state_dir = Path("state/agents") / agent_id
+        trash_dir = Path("trash/agents") / agent_id
+
+        if state_dir.exists():
+            try:
+                trash_dir.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(state_dir), str(trash_dir))
+
+                # Update meta.json in trash
+                meta_path = trash_dir / "meta.json"
+                if meta_path.exists():
+                    import json
+                    meta = json.loads(meta_path.read_text())
+                    meta["destroyed_at"] = datetime.now(timezone.utc).isoformat()
+                    meta["destroy_reason"] = reason
+                    meta_path.write_text(json.dumps(meta, indent=2))
+
+                logger.info("AgentManager: destroyed '%s' → trash (reason: %s)",
+                           agent_id, reason)
+            except Exception as e:
+                logger.warning("AgentManager: destroy_agent failed to move: %s", e)
+        else:
+            logger.info("AgentManager: destroyed '%s' (no state files) (reason: %s)",
+                       agent_id, reason)
+
+    # ── Collection ────────────────────────────────────────────────────
 
     async def collect_all(self, timeout: float = 300.0) -> dict[str, TaskResult]:
         """Wait for all in-flight tasks to complete."""
