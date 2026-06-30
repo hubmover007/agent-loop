@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -72,7 +72,7 @@ class StepLog:
     input: dict[str, Any] = field(default_factory=dict)
     output: Any = None
     error: str | None = None
-    timestamp: datetime = field(default_factory=datetime.now)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 @dataclass
@@ -84,7 +84,7 @@ class TaskResult:
     summary: str
     artifacts: dict[str, Any] = field(default_factory=dict)
     steps: list[StepLog] = field(default_factory=list)
-    completed_at: datetime = field(default_factory=datetime.now)
+    completed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 @dataclass

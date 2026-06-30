@@ -6,7 +6,7 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from ..core import (
@@ -28,7 +28,7 @@ class Agent:
     status: AgentStatus = AgentStatus.IDLE
     role: AgentRole = AgentRole.WORKER
     expertise: list[str] = field(default_factory=list)  # tool names this agent is good at
-    created_at: datetime = field(default_factory=datetime.now)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     task_count: int = 0
     success_count: int = 0
     expert_profile: ExpertProfile | None = None
@@ -36,6 +36,7 @@ class Agent:
     # Isolation
     branch_space_id: str | None = None
     process_id: int | None = None
+    last_idle_at: datetime | None = None  # Track when agent last became idle
 
     async def run(self, agent_loop, task_scope: str, context: dict,
                   allowed_tools: list[str]) -> TaskResult:
@@ -93,6 +94,7 @@ class AgentPool:
             agent = self.agents.get(agent_id)
             if agent:
                 agent.status = AgentStatus.IDLE
+                agent.last_idle_at = datetime.now(timezone.utc)
                 agent.branch_space_id = None
 
     async def destroy(self, agent_id: str) -> None:
@@ -105,13 +107,13 @@ class AgentPool:
 
     async def cleanup_idle(self) -> int:
         """Remove agents idle longer than idle_timeout."""
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         removed = 0
         async with self._lock:
             to_remove = []
             for agent_id, agent in self.agents.items():
-                if agent.status == AgentStatus.IDLE:
-                    idle_seconds = (now - agent.created_at).total_seconds()
+                if agent.status == AgentStatus.IDLE and agent.last_idle_at is not None:
+                    idle_seconds = (now - agent.last_idle_at).total_seconds()
                     if idle_seconds > self.idle_timeout:
                         to_remove.append(agent_id)
 
@@ -119,6 +121,17 @@ class AgentPool:
                 self.agents.pop(agent_id)
                 removed += 1
         return removed
+
+    def stats(self) -> dict:
+        """Return pool statistics."""
+        agents = list(self.agents.values())
+        return {
+            "total": len(agents),
+            "idle": sum(1 for a in agents if a.status == AgentStatus.IDLE),
+            "active": sum(1 for a in agents if a.status == AgentStatus.RUNNING),
+            "done": sum(1 for a in agents if a.status == AgentStatus.DONE),
+            "failed": sum(1 for a in agents if a.status == AgentStatus.FAILED),
+        }
 
 
 # ============================================================

@@ -306,14 +306,9 @@ Output only JSON array of triples:
 Only include meaningful triples. Skip if nothing substantive."""
 
         try:
-            import json
+            from ..utils import extract_json_from_llm_response as _ejfr
             response = await self.llm.chat([{"role": "user", "content": prompt}])
-            content = response.content.strip()
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0]
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0]
-            triples = json.loads(content)
+            triples = _ejfr(response.content, default=[])
             return triples if isinstance(triples, list) else []
         except Exception as e:
             logger.warning("Extract triples LLM call failed: %s", e)

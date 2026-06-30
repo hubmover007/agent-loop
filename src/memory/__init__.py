@@ -12,7 +12,7 @@ All layers connected by semantic edges with vectorized descriptions.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -220,26 +220,29 @@ class MemoryPool:
         """Generic store: accepts a dict with 'type' key, routes to appropriate writer.
 
         Supported types: 'episode', 'fact'.
+
+        Note: creates a shallow copy of data to avoid mutating the caller's dict.
         """
-        record_type = data.pop("type", "episode")
+        data_copy = dict(data)
+        record_type = data_copy.pop("type", "episode")
         if record_type == "episode":
             return await self.write_episode(
-                title=data.pop("title", data.get("user_input", "")[:80]),
-                summary=data.pop("summary", data.get("output", "")),
-                content=data.pop("content", ""),
-                tags=data.pop("tags", None),
-                user_input=data.pop("user_input", ""),
-                output=data.pop("output", ""),
-                task_count=data.pop("task_count", 0),
-                session_id=data.pop("session_id", ""),
-                consolidated=data.pop("consolidated", False),
+                title=data_copy.pop("title", data_copy.get("user_input", "")[:80]),
+                summary=data_copy.pop("summary", data_copy.get("output", "")),
+                content=data_copy.pop("content", ""),
+                tags=data_copy.pop("tags", None),
+                user_input=data_copy.pop("user_input", ""),
+                output=data_copy.pop("output", ""),
+                task_count=data_copy.pop("task_count", 0),
+                session_id=data_copy.pop("session_id", ""),
+                consolidated=data_copy.pop("consolidated", False),
             )
         elif record_type == "fact":
             return await self.write_fact(
-                fact_type=data.pop("fact_type", "entity"),
-                name=data.pop("name", ""),
-                value=data.pop("value", None),
-                embedding_text=data.pop("embedding_text", None),
+                fact_type=data_copy.pop("fact_type", "entity"),
+                name=data_copy.pop("name", ""),
+                value=data_copy.pop("value", None),
+                embedding_text=data_copy.pop("embedding_text", None),
             )
         else:
             raise ValueError(f"Unknown record type: {record_type}")
@@ -304,55 +307,88 @@ class MemoryPool:
 
     async def register_agent(self, agent_id: str, expert_profile: dict | None = None) -> None:
         """Register an agent in the system."""
-        await self._db.create("agent_registry", {
-            "agent_id": agent_id,
-            "status": "idle",
-            "expert_profile": expert_profile,
-        })
+        entry = {"agent_id": agent_id, "status": "idle", "expert_profile": expert_profile}
+        if self._db:
+            await self._db.create("agent_registry", entry)
+        else:
+            registry = self._mem.setdefault("agent_registry", [])
+            registry.append(entry)
 
     async def update_agent_status(self, agent_id: str, status: str) -> None:
         """Update agent status."""
-        await self._db.query(
-            "UPDATE agent_registry SET status = $status WHERE agent_id = $agent_id",
-            {"agent_id": agent_id, "status": status}
-        )
+        if self._db:
+            await self._db.query(
+                "UPDATE agent_registry SET status = $status WHERE agent_id = $agent_id",
+                {"agent_id": agent_id, "status": status}
+            )
+        else:
+            for entry in self._mem.get("agent_registry", []):
+                if entry.get("agent_id") == agent_id:
+                    entry["status"] = status
 
     async def register_task(self, task_id: str, parent_id: str | None, scope: str,
                             priority: int = 3) -> None:
         """Register a task in the system."""
-        await self._db.create("task_registry", {
-            "task_id": task_id,
-            "parent_id": parent_id,
-            "scope": scope,
-            "status": "pending",
-            "priority": priority,
-        })
+        entry = {"task_id": task_id, "parent_id": parent_id, "scope": scope,
+                 "status": "pending", "priority": priority}
+        if self._db:
+            await self._db.create("task_registry", entry)
+        else:
+            registry = self._mem.setdefault("task_registry", [])
+            registry.append(entry)
 
     async def update_task_status(self, task_id: str, status: str,
                                  result: dict | None = None) -> None:
         """Update task status and optionally set result."""
-        updates = {"status": status, "updated_at": datetime.now()}
-        if result:
-            updates["result"] = result
-        await self._db.query(
-            "UPDATE task_registry MERGE $updates WHERE task_id = $task_id",
-            {"task_id": task_id, "updates": updates}
-        )
+        if self._db:
+            updates = {"status": status, "updated_at": datetime.now(timezone.utc)}
+            if result:
+                updates["result"] = result
+            await self._db.query(
+                "UPDATE task_registry MERGE $updates WHERE task_id = $task_id",
+                {"task_id": task_id, "updates": updates}
+            )
+        else:
+            for entry in self._mem.get("task_registry", []):
+                if entry.get("task_id") == task_id:
+                    entry["status"] = status
+                    if result:
+                        entry["result"] = result
+
+    DISCARD_POOL_MAX = 1000  # cap in-memory discard pool to prevent unbounded growth
 
     async def discard_result(self, agent_id: str, task_id: str, reason: str,
                              result: dict | None = None, agent_log: list | None = None) -> None:
         """Write a discarded result to the audit pool."""
-        await self._db.create("discard_pool", {
+        entry = {
             "agent_id": agent_id,
             "task_id": task_id,
             "reason": reason,
             "result": result,
             "agent_log": agent_log or [],
-        })
+            "discarded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if self._db:
+            await self._db.create("discard_pool", entry)
+        else:
+            pool = self._mem.setdefault("discard_pool", [])
+            pool.append(entry)
+            # Trim oldest entries when over cap
+            if len(pool) > self.DISCARD_POOL_MAX:
+                self._mem["discard_pool"] = pool[-self.DISCARD_POOL_MAX:]
 
     async def get_discarded(self, agent_id: str | None = None,
                             task_id: str | None = None) -> list[dict]:
         """Query discarded results for audit."""
+        if not self._db:
+            pool = self._mem.get("discard_pool", [])
+            results = pool
+            if agent_id:
+                results = [e for e in results if e.get("agent_id") == agent_id]
+            if task_id:
+                results = [e for e in results if e.get("task_id") == task_id]
+            return results
+
         conditions = []
         params = {}
         if agent_id:

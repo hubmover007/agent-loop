@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from . import LoopConfig, LoopContext, AgentLoop, ToolLoop, LLMProvider
 from .deep_reason import DeepReasonLoop, DeepReasonConfig
@@ -308,7 +308,7 @@ class MainLoop:
                 "content": ctx.reason_output,
                 "task_count": len(ctx.task_ids),
                 "session_id": ctx.session_id,
-                "tags": ["session", datetime.now().strftime("%Y-%m-%d")],
+                "tags": ["session", datetime.now(timezone.utc).strftime("%Y-%m-%d")],
             })
         except Exception as e:
             logger.warning("Failed to write episode: %s", e)

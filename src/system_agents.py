@@ -34,11 +34,10 @@ This separation ensures:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from .core import (
@@ -75,7 +74,7 @@ class ManagedTask:
     evaluation: EvaluationResult | None = None
 
     # Timestamps
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     started_at: datetime | None = None
     completed_at: datetime | None = None
 
@@ -116,6 +115,7 @@ class TaskRegistry:
     def __init__(self):
         self._tasks: dict[str, ManagedTask] = {}
         self._order: list[str] = []
+        self._lock = asyncio.Lock()  # asyncio-safe: concurrent assign() calls
 
     async def register(self, scope: str, priority: int = 3,
                        dependencies: list[str] | None = None,
@@ -129,8 +129,9 @@ class TaskRegistry:
             required_tools=required_tools or [],
             parent_id=parent_id,
         )
-        self._tasks[task.task_id] = task
-        self._order.append(task.task_id)
+        async with self._lock:
+            self._tasks[task.task_id] = task
+            self._order.append(task.task_id)
         return task
 
     def get(self, task_id: str) -> ManagedTask | None:
@@ -243,12 +244,8 @@ JSON:
 [{{"scope": "...", "priority": 3, "required_tools": [], "dependencies": []}}]
 ```"""
         resp = await self.llm.chat([{"role": "user", "content": prompt}])
-        content = resp.content
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0]
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0]
-        result = json.loads(content.strip())
+        from ..utils import extract_json_from_llm_response
+        result = extract_json_from_llm_response(resp.content, default=[])
         return result if isinstance(result, list) else [result]
 
     def get_ready_tasks(self) -> list[ManagedTask]:
@@ -269,9 +266,9 @@ JSON:
         if error:
             task.error = error
         if status in (TaskStatus.RUNNING,):
-            task.started_at = datetime.utcnow()
+            task.started_at = datetime.now(timezone.utc)
         if status in (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED):
-            task.completed_at = datetime.utcnow()
+            task.completed_at = datetime.now(timezone.utc)
 
     async def replan(self, failed_task: ManagedTask) -> list[ManagedTask] | None:
         """Re-plan a failed task using LLM."""
@@ -284,10 +281,8 @@ Attempts: {failed_task.retry_count}
 
 Return JSON array of alternative subtasks, or empty array if impossible."""
             resp = await self.llm.chat([{"role": "user", "content": prompt}])
-            content = resp.content
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0]
-            subtasks = json.loads(content.strip())
+            from ..utils import extract_json_from_llm_response
+            subtasks = extract_json_from_llm_response(resp.content, default=[])
             if not subtasks:
                 return None
 
@@ -410,7 +405,7 @@ class AgentManagerAgent:
 
         task.status = TaskStatus.RUNNING
         task.assigned_agent_id = agent.agent_id
-        task.started_at = datetime.utcnow()
+        task.started_at = datetime.now(timezone.utc)
 
         asyncio_task = asyncio.create_task(self._execute(task, agent))
         self._inflight[task.task_id] = (agent, asyncio_task)
@@ -427,7 +422,7 @@ class AgentManagerAgent:
         """
         task.status = TaskStatus.RUNNING
         task.assigned_agent_id = f"external:{agent_type}:{task.task_id}"
-        task.started_at = datetime.utcnow()
+        task.started_at = datetime.now(timezone.utc)
 
         asyncio_task = asyncio.create_task(self._execute_external(task, agent_type))
         # Store with a placeholder Agent for compatibility
@@ -498,7 +493,7 @@ class AgentManagerAgent:
                 # Accept: commit to mainline
                 task.status = TaskStatus.DONE
                 task.result = result
-                task.completed_at = datetime.utcnow()
+                task.completed_at = datetime.now(timezone.utc)
                 await branch.commit(self.memory)
                 logger.info("AgentManager: %s DONE (score=%.2f)",
                            task.task_id, eval_result.overall)
@@ -533,7 +528,7 @@ class AgentManagerAgent:
         """Destroy an agent that failed permanently and record to discard pool."""
         task.status = TaskStatus.FAILED
         task.error = reason
-        task.completed_at = datetime.utcnow()
+        task.completed_at = datetime.now(timezone.utc)
 
         # Send to discard pool for audit
         if self.memory:
@@ -587,7 +582,7 @@ class AgentManagerAgent:
                 if eval_result.action == "accept":
                     task.status = TaskStatus.DONE
                     task.result = external_result
-                    task.completed_at = datetime.utcnow()
+                    task.completed_at = datetime.now(timezone.utc)
                     logger.info("AgentManager: external %s → %s DONE",
                                agent_type, task.task_id)
                 else:
@@ -601,7 +596,7 @@ class AgentManagerAgent:
                     else:
                         task.status = TaskStatus.FAILED
                         task.error = eval_result.reason
-                        task.completed_at = datetime.utcnow()
+                        task.completed_at = datetime.now(timezone.utc)
             else:
                 # External agent failed
                 if task.retry_count < task.max_retries:
@@ -611,7 +606,7 @@ class AgentManagerAgent:
                 else:
                     task.status = TaskStatus.FAILED
                     task.error = result_data.get("error", "External agent failed")
-                    task.completed_at = datetime.utcnow()
+                    task.completed_at = datetime.now(timezone.utc)
 
                     if self.memory:
                         await self.memory.discard_result(
@@ -623,7 +618,7 @@ class AgentManagerAgent:
         except Exception as e:
             task.status = TaskStatus.FAILED
             task.error = f"External agent exception: {e}"
-            task.completed_at = datetime.utcnow()
+            task.completed_at = datetime.now(timezone.utc)
             logger.error("AgentManager: external %s exception: %s",
                         agent_type, e)
         finally:
@@ -660,7 +655,7 @@ class AgentManagerAgent:
         task = self.registry.get(task_id)
         if task:
             task.status = TaskStatus.CANCELLED
-            task.completed_at = datetime.utcnow()
+            task.completed_at = datetime.now(timezone.utc)
 
     def stats(self) -> dict:
         pool_stats = self.pool.stats()

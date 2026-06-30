@@ -7,7 +7,7 @@ import logging
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +35,7 @@ class TaskNode:
     # Result tracking
     assigned_agent: str | None = None
     result: dict | None = None
-    created_at: datetime = field(default_factory=datetime.now)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: datetime | None = None
 
     @property
@@ -108,14 +108,14 @@ class TaskTree:
         if node:
             node.status = TaskStatus.DONE
             node.result = result
-            node.completed_at = datetime.now()
+            node.completed_at = datetime.now(timezone.utc)
 
             # Check if all children done → mark parent
             if node.parent_id:
                 parent = self._node_index.get(node.parent_id)
                 if parent and all(c.status == TaskStatus.DONE for c in parent.children):
                     parent.status = TaskStatus.DONE
-                    parent.completed_at = datetime.now()
+                    parent.completed_at = datetime.now(timezone.utc)
 
     def mark_failed(self, task_id: str) -> None:
         """Mark a task as failed."""
@@ -226,15 +226,8 @@ Respond as JSON:
 }}"""
 
             response = await llm.chat([{"role": "user", "content": prompt}])
-            import json
-
-            content = response.content
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0]
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0]
-
-            plan = json.loads(content.strip())
+            from ..utils import extract_json_from_llm_response
+            plan = extract_json_from_llm_response(response.content, default={})
 
             if plan.get("is_complex") and plan.get("subtasks"):
                 for st in plan["subtasks"]:
@@ -285,7 +278,7 @@ class BranchSpace:
         self.memory_snapshot: dict = {}
         self.execution_log: list = []
         self.artifacts: dict[str, Any] = {}
-        self.created_at = datetime.now()
+        self.created_at = datetime.now(timezone.utc)
 
     async def init(self, memory: Any) -> None:
         """Initialize branch space: create directory + capture memory snapshot."""
@@ -336,7 +329,7 @@ class BranchSpace:
     def log(self, action: str, data: dict | None = None) -> None:
         """Log an action in this branch space."""
         self.execution_log.append({
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "action": action,
             "data": data,
         })

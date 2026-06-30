@@ -13,7 +13,7 @@ import logging
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 
 from ..core import (
@@ -110,6 +110,9 @@ class LoopContext:
     agent_results: list[TaskResult] = field(default_factory=list)
     discarded_results: list[str] = field(default_factory=list)
 
+    # Unified memory context (set during RETRIVE phase)
+    memory_context: Any | None = None
+
     # Output
     final_output: str = ""
     errors: list[str] = field(default_factory=list)
@@ -137,7 +140,7 @@ class ToolLoop:
 
         last_error = None
         for attempt in range(1, self.config.tool_max_retries + 1):
-            start = datetime.now()
+            start = datetime.now(timezone.utc)
 
             try:
                 result = await tool.execute(**params)
@@ -147,7 +150,7 @@ class ToolLoop:
                     error=str(e),
                 )
 
-            elapsed = (datetime.now() - start).total_seconds() * 1000
+            elapsed = (datetime.now(timezone.utc) - start).total_seconds() * 1000
             result.execution_time_ms = elapsed
             result.retry_count = attempt - 1
 
@@ -192,7 +195,7 @@ class AgentLoop:
         """
         steps: list[StepLog] = []
         artifacts: dict = {}
-        started_at = datetime.now()
+        started_at = datetime.now(timezone.utc)
 
         logger.info("AgentLoop[%s] started: %s", agent_id, task_scope[:50])
 
@@ -240,7 +243,7 @@ class AgentLoop:
                 step_num += 1
 
                 # Check TTL
-                if (datetime.now() - started_at).total_seconds() > self.config.agent_ttl:
+                if (datetime.now(timezone.utc) - started_at).total_seconds() > self.config.agent_ttl:
                     logger.warning("AgentLoop[%s]: TTL exceeded", agent_id)
                     steps.append(StepLog(
                         step=step_num, action="abort",
@@ -264,7 +267,7 @@ class AgentLoop:
         except Exception as e:
             status = TaskStatus.FAILED
             summary = f"Agent error: {e}"
-            artifact = {}
+            artifacts = {}
             steps.append(StepLog(
                 step=len(steps) + 1, action="error",
                 tool_name=None, error=str(e)
@@ -298,10 +301,16 @@ Keep it concise, maximum {self.config.max_agent_steps} steps.
 Respond with ONLY the JSON array, no other text."""
 
         try:
-            response = await self.llm.chat([{"role": "user", "content": prompt}])
-            import json
-            plan = json.loads(response.content)
+            response = await asyncio.wait_for(
+                self.llm.chat([{"role": "user", "content": prompt}]),
+                timeout=60.0,
+            )
+            from ..utils import extract_json_from_llm_response
+            plan = extract_json_from_llm_response(response.content, default=[])
             return plan if isinstance(plan, list) else []
+        except asyncio.TimeoutError:
+            logger.error("Plan generation timed out")
+            return [{"description": task_scope, "tool": None, "params": {}, "output_key": None}]
         except Exception as e:
             logger.error("Plan generation failed: %s", e)
             return [{"description": task_scope, "tool": None, "params": {}, "output_key": None}]
@@ -330,19 +339,19 @@ Errors: {errors if errors else 'none'}
 Output JSON only: {{"score": <number between 0 and 1>, "reason": "<brief explanation>"}}"""
 
         try:
-            import json
-            response = await self.llm.chat([{"role": "user", "content": prompt}])
-            # Extract JSON from response (may be wrapped in markdown code block)
-            content = response.content.strip()
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0]
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0]
-            result = json.loads(content)
+            response = await asyncio.wait_for(
+                self.llm.chat([{"role": "user", "content": prompt}]),
+                timeout=30.0,
+            )
+            from ..utils import extract_json_from_llm_response
+            result = extract_json_from_llm_response(response.content, default={})
             score = float(result.get("score", 0.5))
             logger.info("LLM self-eval score=%.2f reason=%s", score, result.get("reason", ""))
             return min(1.0, max(0.0, score))
 
+        except asyncio.TimeoutError:
+            logger.warning("LLM self-eval timed out, falling back to heuristics")
+            return self._heuristic_evaluate(steps)
         except Exception as e:
             logger.warning("LLM self-eval failed: %s, falling back to heuristics", e)
             return self._heuristic_evaluate(steps)
@@ -382,11 +391,16 @@ Errors encountered: {errors if errors else 'none'}
 Provide a concise summary:"""
 
         try:
-            response = await self.llm.chat([{"role": "user", "content": prompt}])
+            response = await asyncio.wait_for(
+                self.llm.chat([{"role": "user", "content": prompt}]),
+                timeout=30.0,
+            )
             summary = response.content.strip()
             if summary:
                 logger.info("LLM summary generated: %s", summary[:80])
                 return summary
+        except asyncio.TimeoutError:
+            logger.warning("LLM summary timed out, falling back to string concat")
         except Exception as e:
             logger.warning("LLM summary failed: %s, falling back to string concat", e)
 

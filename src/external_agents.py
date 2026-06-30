@@ -31,12 +31,11 @@ can detect which agents are installed and available.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import shutil
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from .core import TaskStatus, TaskResult, AgentRole, AgentStatus
@@ -341,7 +340,7 @@ class ExternalAgentBridge:
             self._active_sessions[session_id] = {
                 "agent_type": agent_type,
                 "task": task,
-                "started_at": datetime.utcnow().isoformat(),
+                "started_at": datetime.now(timezone.utc).isoformat(),
                 "status": result["status"],
             }
 
