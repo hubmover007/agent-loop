@@ -40,6 +40,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from pathlib import Path
+
+import yaml
+
 from .core import (
     TaskStatus, AgentStatus, TaskResult, EvaluationResult,
     StepLog, AgentRole, LoopPhase,
@@ -107,6 +111,83 @@ class ManagedTask:
     def is_terminal(self) -> bool:
         """Task has reached a final state."""
         return self.status in (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED)
+
+
+# ============================================================
+# AgentTemplate — per-agent LLM + config spec
+# ============================================================
+
+from dataclasses import dataclass as _dc
+
+@_dc
+class AgentTemplate:
+    """Structured spec for agent creation (from config/agent_templates.yaml)."""
+    name: str
+    llm_strategy: str = "balanced"
+    llm_capabilities_required: list = None  # type: ignore
+    max_steps: int = 10
+    ttl: int = 300
+    tools_allowed: list = None  # type: ignore
+
+    def __post_init__(self):
+        if self.llm_capabilities_required is None:
+            self.llm_capabilities_required = ["general"]
+        if self.tools_allowed is None:
+            self.tools_allowed = []
+
+
+class AgentTemplateRegistry:
+    """Loads agent templates from config/agent_templates.yaml."""
+
+    DEFAULT_TEMPLATE = AgentTemplate(name="default_worker")
+
+    def __init__(self, config_path: str | Path = "config/agent_templates.yaml"):
+        self._path = Path(config_path)
+        self._templates: dict[str, AgentTemplate] = {}
+        self._loaded = False
+
+    def load(self) -> None:
+        if self._loaded:
+            return
+        if not self._path.exists():
+            logger.warning("AgentTemplateRegistry: %s not found, using defaults", self._path)
+            self._loaded = True
+            return
+        with open(self._path) as f:
+            data = yaml.safe_load(f)
+        for name, d in data.get("templates", {}).items():
+            self._templates[name] = AgentTemplate(
+                name=name,
+                llm_strategy=d.get("llm_strategy", "balanced"),
+                llm_capabilities_required=d.get("llm_capabilities_required", ["general"]),
+                max_steps=d.get("max_steps", 10),
+                ttl=d.get("ttl", 300),
+                tools_allowed=d.get("tools_allowed", []),
+            )
+        self._loaded = True
+        logger.info("AgentTemplateRegistry: loaded %d templates from %s",
+                    len(self._templates), self._path)
+
+    def get(self, name: str) -> AgentTemplate:
+        """Get template by name, fallback to default_worker."""
+        if not self._loaded:
+            self.load()
+        return self._templates.get(name, self._templates.get("default_worker", self.DEFAULT_TEMPLATE))
+
+    def infer_template(self, task: "ManagedTask") -> AgentTemplate:
+        """Infer the best template from task scope and required_tools."""
+        if not self._loaded:
+            self.load()
+        scope_lower = task.scope.lower()
+        tools = set(task.required_tools or [])
+
+        if any(kw in scope_lower for kw in ["code", "debug", "implement", "refactor", "fix"]):
+            return self.get("coding_expert")
+        if any(kw in scope_lower for kw in ["reason", "analyze", "plan", "math", "calculate"]):
+            return self.get("reasoning_expert")
+        if any(kw in scope_lower for kw in ["quick", "fast", "brief", "summary"]):
+            return self.get("fast_responder")
+        return self.get("default_worker")
 
 
 class TaskRegistry:
@@ -329,7 +410,8 @@ class AgentManagerAgent:
                  config: LoopConfig, registry: TaskRegistry,
                  external_bridge: ExternalAgentBridge | None = None,
                  llm_pool: Any | None = None,
-                 state_store: Any | None = None):
+                 state_store: Any | None = None,
+                 template_registry: AgentTemplateRegistry | None = None):
         self.memory = memory
         self.agent_loop = agent_loop
         self.config = config
@@ -340,6 +422,10 @@ class AgentManagerAgent:
 
         # Optional StateStore for structured persistence
         self.state_store = state_store
+
+        # Agent template registry — JSON/YAML driven, no free-form LLM selection
+        self.template_registry = template_registry or AgentTemplateRegistry()
+        self.template_registry.load()
 
         # Internal agent pool
         self.pool = AgentPool(max_concurrent=config.max_agent_concurrent)
@@ -446,38 +532,58 @@ class AgentManagerAgent:
     async def _acquire_worker(self, task: ManagedTask) -> Agent | None:
         """Find idle agent or create new one.
 
-        If llm_pool is available, assigns an LLM provider based on
-        capability requirements derived from the task scope.
+        Uses AgentTemplateRegistry to determine which template fits the task,
+        then uses LLMPool to select the appropriate LLM provider per template spec.
+        All selection is driven by config/agent_templates.yaml + config/llm_pool.yaml,
+        never by free-form LLM inference.
         """
-        # Try to reuse idle agent
+        # Infer template from task (config-driven, not LLM-driven)
+        template = self.template_registry.infer_template(task)
+
+        # Try to reuse idle agent with matching expertise
         for agent in self.pool.agents.values():
             if agent.status == AgentStatus.IDLE:
-                # Could do MoE matching here based on task.required_tools
                 return agent
 
         # Create new worker
         agent = await self.pool.acquire()
-        if agent:
-            agent.role = AgentRole.WORKER
-            agent.expertise = task.required_tools
+        if not agent:
+            return None
 
-            # Use llm_pool to select LLM provider for this agent if available
-            if self.llm_pool:
-                try:
-                    capabilities = self._infer_capabilities(task)
-                    provider = await self.llm_pool.acquire(
-                        capabilities=capabilities,
-                        strategy="balanced",
-                    )
-                    # Attach provider reference to agent (stored in external data)
-                    agent._llm_provider = provider
-                    if self.state_store:
-                        agent._llm_provider_id = provider.provider_id
-                except Exception as e:
-                    logger.warning("AgentManager: llm_pool acquire failed: %s", e)
+        agent.role = AgentRole.WORKER
+        agent.expertise = task.required_tools or template.llm_capabilities_required
+
+        # Structured LLM selection: template spec → llm_pool strategy
+        # This is system-level config resolution, not LLM-driven
+        if self.llm_pool:
+            try:
+                provider = await self.llm_pool.acquire(
+                    capabilities=template.llm_capabilities_required,
+                    strategy=template.llm_strategy,
+                )
+                # Bind LLM provider to agent for use in AgentLoop
+                agent._llm_provider = provider
+                agent._llm_provider_id = provider.provider_id
+                agent._template_name = template.name
+                logger.info(
+                    "AgentManager: agent %s bound to provider '%s' via template '%s' (strategy=%s)",
+                    agent.agent_id, provider.provider_id, template.name, template.llm_strategy
+                )
+            except Exception as e:
+                logger.warning(
+                    "AgentManager: llm_pool acquire failed for template '%s': %s — using default LLM",
+                    template.name, e
+                )
+
+        # Apply template limits to AgentLoop config
+        if template.max_steps != self.config.max_agent_steps:
+            agent._max_steps_override = template.max_steps
+        if template.ttl != self.config.agent_ttl:
+            agent._ttl_override = template.ttl
 
         return agent
 
+    # _infer_capabilities is kept for backward compat but template_registry is preferred
     @staticmethod
     def _infer_capabilities(task: ManagedTask) -> list[str]:
         """Infer required LLM capabilities from task scope and required_tools."""
@@ -540,12 +646,32 @@ class AgentManagerAgent:
                 "priority": task.priority,
                 "required_tools": task.required_tools,
                 "branch_dir": str(branch.base_dir),
+                "template": getattr(agent, "_template_name", "default_worker"),
+                "llm_provider_id": getattr(agent, "_llm_provider_id", None),
             }
 
-            result = await agent.run(
-                self.agent_loop, task.scope, context,
-                allowed_tools=task.required_tools,
-            )
+            # Use agent-bound LLM if available (from llm_pool + template selection)
+            # Otherwise fall back to the shared agent_loop with its default LLM
+            bound_llm = getattr(agent, "_llm_provider", None)
+            if bound_llm is not None:
+                from .loop_engine import AgentLoop as _AgentLoop
+                dedicated_loop = _AgentLoop(
+                    tool_loop=self.agent_loop.tool_loop,
+                    llm=bound_llm,
+                    config=self.config,
+                )
+                # Apply per-agent step/TTL overrides from template
+                if hasattr(agent, "_max_steps_override"):
+                    dedicated_loop.config = type(self.config)(
+                        **{**self.config.__dict__,
+                           "max_agent_steps": agent._max_steps_override,
+                           "agent_ttl": getattr(agent, "_ttl_override", self.config.agent_ttl)}
+                    )
+                result = await agent.run(dedicated_loop, task.scope, context,
+                                        allowed_tools=task.required_tools)
+            else:
+                result = await agent.run(self.agent_loop, task.scope, context,
+                                        allowed_tools=task.required_tools)
 
             branch.log("task_completed", {"summary": result.summary})
 
