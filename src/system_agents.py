@@ -327,11 +327,19 @@ class AgentManagerAgent:
 
     def __init__(self, memory: Any, agent_loop: AgentLoop,
                  config: LoopConfig, registry: TaskRegistry,
-                 external_bridge: ExternalAgentBridge | None = None):
+                 external_bridge: ExternalAgentBridge | None = None,
+                 llm_pool: Any | None = None,
+                 state_store: Any | None = None):
         self.memory = memory
         self.agent_loop = agent_loop
         self.config = config
         self.registry = registry
+
+        # Optional LLM Pool for provider selection
+        self.llm_pool = llm_pool
+
+        # Optional StateStore for structured persistence
+        self.state_store = state_store
 
         # Internal agent pool
         self.pool = AgentPool(max_concurrent=config.max_agent_concurrent)
@@ -436,7 +444,11 @@ class AgentManagerAgent:
         return True
 
     async def _acquire_worker(self, task: ManagedTask) -> Agent | None:
-        """Find idle agent or create new one."""
+        """Find idle agent or create new one.
+
+        If llm_pool is available, assigns an LLM provider based on
+        capability requirements derived from the task scope.
+        """
         # Try to reuse idle agent
         for agent in self.pool.agents.values():
             if agent.status == AgentStatus.IDLE:
@@ -448,7 +460,43 @@ class AgentManagerAgent:
         if agent:
             agent.role = AgentRole.WORKER
             agent.expertise = task.required_tools
+
+            # Use llm_pool to select LLM provider for this agent if available
+            if self.llm_pool:
+                try:
+                    capabilities = self._infer_capabilities(task)
+                    provider = await self.llm_pool.acquire(
+                        capabilities=capabilities,
+                        strategy="balanced",
+                    )
+                    # Attach provider reference to agent (stored in external data)
+                    agent._llm_provider = provider
+                    if self.state_store:
+                        agent._llm_provider_id = provider.provider_id
+                except Exception as e:
+                    logger.warning("AgentManager: llm_pool acquire failed: %s", e)
+
         return agent
+
+    @staticmethod
+    def _infer_capabilities(task: ManagedTask) -> list[str]:
+        """Infer required LLM capabilities from task scope and required_tools."""
+        capabilities: set = set()
+        scope_lower = task.scope.lower()
+
+        if any(kw in scope_lower for kw in ["code", "debug", "implement", "refactor"]):
+            capabilities.add("coding")
+        if any(kw in scope_lower for kw in ["reason", "analyze", "plan", "think"]):
+            capabilities.add("reasoning")
+        if any(kw in scope_lower for kw in ["math", "calculate", "compute"]):
+            capabilities.add("math")
+        if any(kw in scope_lower for kw in ["long", "document", "report"]):
+            capabilities.add("long_context")
+
+        if not capabilities:
+            capabilities.add("general")
+
+        return list(capabilities)
 
     async def _execute(self, task: ManagedTask, agent: Agent) -> None:
         """Execute a task with a worker agent.
@@ -460,6 +508,22 @@ class AgentManagerAgent:
           4. Accept → commit to mainline → release agent
           5. Discard → retry or fail → destroy agent → discard pool
         """
+        # Save agent state on start (if state_store available)
+        if self.state_store:
+            try:
+                await self.state_store.save_agent(agent.agent_id, {
+                    "agent_id": agent.agent_id,
+                    "status": agent.status,
+                    "role": agent.role,
+                    "expertise": agent.expertise,
+                    "task_count": agent.task_count,
+                    "success_count": agent.success_count,
+                    "created_at": agent.created_at,
+                    "llm_provider_id": getattr(agent, '_llm_provider_id', None),
+                })
+            except Exception as e:
+                logger.warning("AgentManager: state_store.save_agent failed: %s", e)
+
         # Create branch space
         branch = BranchSpace(task_id=task.task_id, agent_id=agent.agent_id)
         try:
@@ -511,9 +575,22 @@ class AgentManagerAgent:
                     await self._destroy_agent_on_failure(task, agent, eval_result.reason)
                     return
 
+            # Save task state on completion (if state_store available)
+            if self.state_store:
+                try:
+                    await self.state_store.save_task(task)
+                except Exception as e:
+                    logger.warning("AgentManager: state_store.save_task failed: %s", e)
+
         except Exception as e:
             branch.log("task_exception", {"error": str(e)})
             await self._destroy_agent_on_failure(task, agent, f"Exception: {e}")
+            # Save failed task state
+            if self.state_store:
+                try:
+                    await self.state_store.save_task(task)
+                except Exception as se:
+                    logger.warning("AgentManager: state_store.save_task failed: %s", se)
             logger.error("AgentManager: %s exception: %s", task.task_id, e)
 
         finally:

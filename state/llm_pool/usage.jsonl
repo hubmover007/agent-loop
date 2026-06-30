@@ -1,0 +1,6 @@
+{"timestamp": "2026-06-30T08:06:49Z", "provider_id": "p1", "model": "m1", "input_tokens": 10, "output_tokens": 20, "latency_ms": 0.0, "success": true, "task_id": null, "agent_id": null}
+{"timestamp": "2026-06-30T08:06:49Z", "provider_id": "p1", "model": "m1", "input_tokens": 10, "output_tokens": 20, "latency_ms": 0.0, "success": true, "task_id": null, "agent_id": null}
+{"timestamp": "2026-06-30T08:07:15Z", "provider_id": "single", "model": "m1", "input_tokens": 10, "output_tokens": 20, "latency_ms": 300.5, "success": true, "task_id": null, "agent_id": null}
+{"timestamp": "2026-06-30T08:07:15Z", "provider_id": "single", "model": "m1", "input_tokens": 10, "output_tokens": 20, "latency_ms": 600.9, "success": true, "task_id": null, "agent_id": null}
+{"timestamp": "2026-06-30T08:07:15Z", "provider_id": "p1", "model": "m1", "input_tokens": 10, "output_tokens": 20, "latency_ms": 0.0, "success": true, "task_id": null, "agent_id": null}
+{"timestamp": "2026-06-30T08:07:15Z", "provider_id": "p1", "model": "m1", "input_tokens": 10, "output_tokens": 20, "latency_ms": 0.0, "success": true, "task_id": null, "agent_id": null}

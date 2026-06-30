@@ -1,0 +1,65 @@
+providers:
+  - id: deepseek-chat
+    type: openai_compatible
+    base_url: https://api.deepseek.com
+    model: deepseek-chat
+    api_key_env: DEEPSEEK_API_KEY
+    capabilities: [reasoning, coding, general]
+    cost_per_1k_tokens: 0.001
+    avg_latency_ms: 800
+    max_concurrent: 10
+    enabled: true
+
+  - id: deepseek-reasoner
+    type: openai_compatible
+    base_url: https://api.deepseek.com
+    model: deepseek-reasoner
+    api_key_env: DEEPSEEK_API_KEY
+    capabilities: [reasoning, math, analysis]
+    cost_per_1k_tokens: 0.004
+    avg_latency_ms: 2000
+    max_concurrent: 5
+    enabled: true
+
+  - id: claude-sonnet
+    type: anthropic_bedrock
+    model: us.anthropic.claude-sonnet-4-6-v1
+    capabilities: [reasoning, coding, long_context, general]
+    cost_per_1k_tokens: 0.003
+    avg_latency_ms: 1200
+    max_concurrent: 5
+    enabled: false  # 需要 AWS 凭证才启用
+
+  - id: glm-local
+    type: openai_compatible
+    base_url: http://localhost:11434/v1
+    model: glm52-local
+    api_key_env: null
+    capabilities: [general, coding]
+    cost_per_1k_tokens: 0.0
+    avg_latency_ms: 500
+    max_concurrent: 2
+    enabled: false  # 本地模型，按需启用
+
+strategies:
+  default: balanced
+  coding_task: cheapest_capable
+  reasoning_task: most_capable
+  fast_task: fastest
+  budget_task: cheapest
+
+strategy_definitions:
+  cheapest:
+    sort_by: cost_per_1k_tokens
+    ascending: true
+  fastest:
+    sort_by: avg_latency_ms
+    ascending: true
+  most_capable:
+    sort_by: cost_per_1k_tokens
+    ascending: false  # 贵的通常更强
+  cheapest_capable:
+    sort_by: cost_per_1k_tokens
+    ascending: true
+  balanced:
+    formula: "cost * 0.4 + latency_normalized * 0.3 + capability_score * 0.3"

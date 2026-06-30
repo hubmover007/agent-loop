@@ -24,10 +24,13 @@ logger = logging.getLogger(__name__)
 class MainLoop:
     """The outermost Loop Engine that orchestrates the full cycle."""
 
-    def __init__(self, memory: MemoryPool, llm: LLMProvider, config: LoopConfig | None = None):
+    def __init__(self, memory: MemoryPool, llm: LLMProvider,
+                 config: LoopConfig | None = None,
+                 state_store: Any | None = None):
         self.memory = memory
         self.llm = llm
         self.config = config or LoopConfig()
+        self.state_store = state_store
 
         # Sub-systems
         from ..tools.base import ToolRegistry
@@ -286,6 +289,8 @@ class MainLoop:
                 })
             except Exception as e:
                 logger.warning("Failed to write episode: %s", e)
+            # Save session state
+            await self._save_session(ctx)
             return
 
         # Synthesize results
@@ -313,7 +318,30 @@ class MainLoop:
         except Exception as e:
             logger.warning("Failed to write episode: %s", e)
 
+        # Save session state
+        await self._save_session(ctx)
+
         logger.info("MainLoop[%s]: OUTPUT completed", ctx.session_id)
+
+    async def _save_session(self, ctx: LoopContext) -> None:
+        """Save session state to StateStore if available."""
+        if not self.state_store:
+            return
+        try:
+            await self.state_store.save_session(ctx.session_id, {
+                "session_id": ctx.session_id,
+                "user_input": ctx.user_input,
+                "final_output": ctx.final_output,
+                "task_count": len(ctx.task_ids),
+                "task_ids": ctx.task_ids,
+                "error_count": len(ctx.errors),
+                "errors": ctx.errors,
+                "reason_confidence": ctx.reason_confidence,
+                "reason_iterations": ctx.reason_iterations,
+                "phase": ctx.current_phase.value,
+            })
+        except Exception as e:
+            logger.warning("MainLoop: state_store.save_session failed: %s", e)
 
     # ============================================================
     # Main Loop
