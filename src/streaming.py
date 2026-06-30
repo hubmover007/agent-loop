@@ -176,3 +176,19 @@ class ProgressEmitter:
         """Remove all subscribers and callbacks (cleanup)."""
         self._subscribers.clear()
         self._callbacks.clear()
+
+    # ── P0: Streaming tokens & tool call events ───────────────────
+
+    def emit_token(self, token: str) -> None:
+        """Emit a single token during streaming."""
+        self.emit("token", "EXECUTE", token)
+
+    def emit_tool_call(self, tool_name: str, args: dict) -> None:
+        """Emit a tool call event."""
+        self.emit("tool_call", "EXECUTE", f"Calling {tool_name}",
+                  tool=tool_name, args=args)
+
+    def emit_tool_result(self, tool_name: str, result: str) -> None:
+        """Emit a tool result event."""
+        self.emit("tool_result", "EXECUTE", result,
+                  tool=tool_name, result=result)

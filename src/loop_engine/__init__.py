@@ -9,9 +9,12 @@ Three levels of loops:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -23,6 +26,10 @@ from ..core import (
 from ..tools.base import ToolInterface, ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+# ── P0: Default limits ───────────────────────────────────────────
+DEFAULT_MAX_ITERATIONS = 20
+DEFAULT_TIMEOUT_SECONDS = 300
 
 
 # ============================================================
@@ -67,6 +74,40 @@ class LLMResponse:
     model: str
     usage: dict = field(default_factory=dict)
     thinking: str | None = None  # Extended thinking content
+    finish_reason: str = "stop"  # stop | tool_calls | length
+    tool_calls: list[dict] | None = None  # OpenAI-format tool_calls
+
+
+# ── P0: Tool Calling / Streaming types ───────────────────────────
+
+@dataclass
+class ToolFunction:
+    """Function definition in a tool call."""
+    name: str
+    arguments: str  # JSON string
+
+
+@dataclass
+class ToolCall:
+    """A single tool call from the LLM."""
+    id: str
+    function: ToolFunction
+
+
+@dataclass
+class ChatResponse:
+    """High-level chat response with parsed tool calls."""
+    content: str
+    tool_calls: list[ToolCall] | None = None
+    finish_reason: str = "stop"
+
+
+@dataclass
+class ChatStreamChunk:
+    """A single streaming chunk from the LLM."""
+    delta_content: str = ""
+    delta_tool_calls: list[dict] | None = None
+    finish_reason: str | None = None
 
 
 class LLMProvider(ABC):
@@ -74,8 +115,29 @@ class LLMProvider(ABC):
 
     @abstractmethod
     async def chat(self, messages: list[dict], **kwargs) -> LLMResponse:
-        """Send a chat completion request."""
+        """Send a chat completion request.
+
+        Providers SHOULD accept these optional kwargs:
+            tools: OpenAI-format tool definitions list
+            tool_choice: "auto" | "none" | "required" | specific dict
+        """
         ...
+
+    async def chat_stream(self, messages: list[dict],
+                          tools: list[dict] | None = None) -> AsyncGenerator:
+        """Stream chat response token-by-token.
+
+        Default: falls back to chat() and yields a single chunk.
+        Providers SHOULD override for true streaming.
+
+        Yields:
+            ChatStreamChunk
+        """
+        response = await self.chat(messages, tools=tools)
+        yield ChatStreamChunk(
+            delta_content=response.content,
+            finish_reason=response.finish_reason,
+        )
 
     @abstractmethod
     async def embed(self, text: str | list[str]) -> list[list[float]]:
@@ -191,7 +253,9 @@ class AgentLoop:
                  tool_registry: Any | None = None,
                  multimodal_processor: Any | None = None,
                  sandbox: Any | None = None,
-                 agent_permissions: Any | None = None):
+                 agent_permissions: Any | None = None,
+                 max_iterations: int = DEFAULT_MAX_ITERATIONS,
+                 timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS):
         self.tool_loop = tool_loop
         self.llm = llm
         self.config = config
@@ -204,6 +268,8 @@ class AgentLoop:
         self.multimodal_processor = multimodal_processor  # Optional MultimodalProcessor
         self.sandbox = sandbox  # Optional SandboxManager for code execution
         self.agent_permissions = agent_permissions  # Optional AgentPermissions for access control
+        self.max_iterations = max_iterations  # P0: Max agent loop iterations
+        self.timeout_seconds = timeout_seconds  # P0: Agent timeout in seconds
 
     async def run(self, agent_id: str, task_scope: str, context: dict,
                   allowed_tools: list[str],
@@ -224,7 +290,33 @@ class AgentLoop:
         """
         steps: list[StepLog] = []
         artifacts: dict = {}
+        iteration = 0
         started_at = datetime.now(timezone.utc)
+        loop_start_time = time.time()
+
+        # ── P0: Iteration & timeout guard ──────────────────────────
+        # AgentLoop.run() is a single-pass per invocation; the iteration
+        # counter is checked once here and at timeout points.
+        # Multi-pass retry logic lives at MainLoop level.
+        iteration += 1
+        if iteration > self.max_iterations:
+            logger.warning("AgentLoop[%s]: max iterations (%d) reached before start",
+                           agent_id, self.max_iterations)
+            return TaskResult(
+                task_id=context.get("task_id", ""),
+                agent_id=agent_id,
+                status=TaskStatus.FAILED,
+                summary=f"Max iterations ({self.max_iterations}) reached",
+            )
+        if time.time() - loop_start_time > self.timeout_seconds:
+            logger.warning("AgentLoop[%s]: timeout %ds exceeded before start",
+                           agent_id, self.timeout_seconds)
+            return TaskResult(
+                task_id=context.get("task_id", ""),
+                agent_id=agent_id,
+                status=TaskStatus.FAILED,
+                summary=f"Timeout after {self.timeout_seconds}s",
+            )
 
         # ── Multimodal input processing ──────────────────────────
         if multimodal_inputs and self.multimodal_processor:
@@ -245,14 +337,42 @@ class AgentLoop:
         try:
             # Phase 1: PLAN
             _emit("phase_start", "PLAN", f"Starting plan for: {task_scope[:80]}")
+
+            # ── P0: Timeout guard ──────────────────────────────
+            if time.time() - loop_start_time > self.timeout_seconds:
+                return TaskResult(
+                    task_id=context.get("task_id", ""),
+                    agent_id=agent_id,
+                    status=TaskStatus.FAILED,
+                    summary=f"Timeout after {self.timeout_seconds}s",
+                )
+
             plan = await self._plan(task_scope, context)
             steps.append(StepLog(step=0, action="plan", tool_name=None, output=plan))
             _emit("phase_done", "PLAN", f"Plan generated: {len(plan)} steps")
+
+            # ── P0: Timeout guard after plan ──────────────────
+            if time.time() - loop_start_time > self.timeout_seconds:
+                return TaskResult(
+                    task_id=context.get("task_id", ""),
+                    agent_id=agent_id,
+                    status=TaskStatus.FAILED,
+                    summary=f"Timeout after {self.timeout_seconds}s",
+                )
 
             # Phase 2: EXECUTE
             _emit("phase_start", "EXECUTE", f"Executing {len(plan)} steps")
             step_num = 1
             for action in plan:
+                # ── P0: Timeout guard during execution ─────────
+                if time.time() - loop_start_time > self.timeout_seconds:
+                    return TaskResult(
+                        task_id=context.get("task_id", ""),
+                        agent_id=agent_id,
+                        status=TaskStatus.FAILED,
+                        summary=f"Timeout after {self.timeout_seconds}s",
+                    )
+
                 if step_num > self.config.max_agent_steps:
                     steps.append(StepLog(
                         step=step_num, action="abort",

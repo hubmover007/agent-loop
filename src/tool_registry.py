@@ -185,6 +185,17 @@ class ToolRegistry:
         tools = self.list_tools(namespace=namespace)
         return [t.to_openai_function() for t in tools]
 
+    def to_openai_tools(self, namespace: str | None = None) -> list[dict]:
+        """Convert to OpenAI tool calling format (alias for to_openai_functions).
+
+        Returns:
+            [{"type": "function", "function": {"name": "...", "description": "...", "parameters": {...}}}]
+
+        Args:
+            namespace: If provided, only include tools from this namespace.
+        """
+        return self.to_openai_functions(namespace=namespace)
+
     # ── Invocation ────────────────────────────────────────────────
 
     async def invoke(self, name: str, args: dict,

@@ -54,7 +54,8 @@ class DeepSeekProvider(LLMProvider):
 
     async def chat(self, messages: list[dict], thinking: bool = False,
                    max_tokens: int = 4096, temperature: float = 0.7,
-                   model: str | None = None, **kwargs) -> LLMResponse:
+                   model: str | None = None, tools: list[dict] | None = None,
+                   tool_choice: str = "auto", **kwargs) -> LLMResponse:
         self._ensure_client()
 
         payload = {
@@ -63,6 +64,10 @@ class DeepSeekProvider(LLMProvider):
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = tool_choice
 
         if thinking:
             # DeepSeek-R1 style: force thinking via system message
@@ -76,7 +81,8 @@ class DeepSeekProvider(LLMProvider):
             data = resp.json()
 
             choice = data["choices"][0]
-            content = choice["message"]["content"]
+            content = choice["message"].get("content", "") or ""
+            tool_calls = choice["message"].get("tool_calls")
 
             # Extract thinking if present (DeepSeek-R1)
             thinking_text = None
@@ -89,6 +95,7 @@ class DeepSeekProvider(LLMProvider):
                 usage=data.get("usage", {}),
                 thinking=thinking_text,
                 finish_reason=choice.get("finish_reason", "stop"),
+                tool_calls=tool_calls,
             )
         except Exception as e:
             logger.error("DeepSeek chat failed: %s", e)
@@ -134,7 +141,17 @@ class AnthropicBedrockProvider(LLMProvider):
 
     async def chat(self, messages: list[dict], thinking: bool = False,
                    max_tokens: int = 4096, temperature: float = 0.7,
-                   model: str | None = None, **kwargs) -> LLMResponse:
+                   model: str | None = None, tools: list[dict] | None = None,
+                   tool_choice: str = "auto", **kwargs) -> LLMResponse:
+        self._ensure_client()
+
+        # Anthropic uses a different tool format; gracefully fall back if tools requested
+        if tools:
+            logger.warning(
+                "AnthropicBedrockProvider: tool calling requested but Anthropic format differs. "
+                "Tools will be ignored for this provider. Use an OpenAI-compatible provider for "
+                "full tool calling support."
+            )
         self._ensure_client()
 
         model_id = model or self.default_model
@@ -262,7 +279,8 @@ class OpenAICompatibleProvider(LLMProvider):
 
     async def chat(self, messages: list[dict], thinking: bool = False,
                    max_tokens: int = 4096, temperature: float = 0.7,
-                   model: str | None = None, **kwargs) -> LLMResponse:
+                   model: str | None = None, tools: list[dict] | None = None,
+                   tool_choice: str = "auto", **kwargs) -> LLMResponse:
         self._ensure_client()
 
         payload = {
@@ -273,22 +291,82 @@ class OpenAICompatibleProvider(LLMProvider):
             **kwargs,
         }
 
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = tool_choice
+
         try:
             resp = await self._client.post("/v1/chat/completions", json=payload)
             resp.raise_for_status()
             data = resp.json()
 
             choice = data["choices"][0]
-            content = choice["message"]["content"]
+            content = choice["message"].get("content", "") or ""
+            tool_calls = choice["message"].get("tool_calls")
 
             return LLMResponse(
                 content=content,
                 model=data.get("model", payload["model"]),
                 usage=data.get("usage", {}),
                 finish_reason=choice.get("finish_reason", "stop"),
+                tool_calls=tool_calls,
             )
         except Exception as e:
             logger.error("OpenAI-compatible chat failed: %s", e)
+            raise
+
+    async def chat_stream(self, messages: list[dict],
+                          tools: list[dict] | None = None,
+                          tool_choice: str = "auto",
+                          model: str | None = None,
+                          **kwargs):
+        """Stream chat completion via SSE.
+
+        Yields:
+            ChatStreamChunk
+        """
+        from .loop_engine import ChatStreamChunk
+
+        self._ensure_client()
+
+        payload = {
+            "model": model or self.default_model,
+            "messages": messages,
+            "stream": True,
+            **kwargs,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = tool_choice
+
+        try:
+            async with self._client.stream("POST", "/v1/chat/completions", json=payload) as resp:
+                resp.raise_for_status()
+                buffer = b""
+                async for chunk in resp.aiter_bytes():
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if line.startswith(b"data: "):
+                            data_str = line[6:].decode("utf-8", errors="replace")
+                            if data_str == "[DONE]":
+                                return
+                            try:
+                                data = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
+                            choice = data["choices"][0]
+                            delta = choice.get("delta", {})
+                            yield ChatStreamChunk(
+                                delta_content=delta.get("content", "") or "",
+                                delta_tool_calls=delta.get("tool_calls"),
+                                finish_reason=choice.get("finish_reason"),
+                            )
+        except Exception as e:
+            logger.error("OpenAI-compatible chat_stream failed: %s", e)
             raise
 
     async def embed(self, text: str | list[str], model: str | None = None) -> list[list[float]]:

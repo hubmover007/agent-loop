@@ -201,3 +201,104 @@ class TestProgressEmitterCore:
             pass
 
         assert "async hello" in received
+
+
+# ============================================================
+# P0: Token & Tool Call Streaming
+# ============================================================
+
+@pytest.mark.asyncio
+class TestStreamingTokens:
+    """Tests for P0 streaming events: token, tool_call, tool_result."""
+
+    async def test_emit_token(self):
+        """emit_token should emit a 'token' type progress event."""
+        emitter = ProgressEmitter("agent-tok")
+        q = await emitter.subscribe()
+
+        emitter.emit_token("Hello")
+        emitter.emit_token(" world")
+
+        ev1 = q.get_nowait()
+        assert ev1.type == "token"
+        assert ev1.message == "Hello"
+
+        ev2 = q.get_nowait()
+        assert ev2.type == "token"
+        assert ev2.message == " world"
+
+    async def test_emit_tool_call(self):
+        """emit_tool_call should emit a 'tool_call' type event with tool name and args."""
+        emitter = ProgressEmitter("agent-tc")
+        q = await emitter.subscribe()
+
+        emitter.emit_tool_call("search", {"query": "weather"})
+
+        ev = q.get_nowait()
+        assert ev.type == "tool_call"
+        assert ev.data["tool"] == "search"
+        assert ev.data["args"] == {"query": "weather"}
+
+    async def test_emit_tool_result(self):
+        """emit_tool_result should emit a 'tool_result' type event."""
+        emitter = ProgressEmitter("agent-tr")
+        q = await emitter.subscribe()
+
+        emitter.emit_tool_result("search", "Found: sunny, 25°C")
+
+        ev = q.get_nowait()
+        assert ev.type == "tool_result"
+        assert ev.data["tool"] == "search"
+        assert ev.data["result"] == "Found: sunny, 25°C"
+
+    async def test_loop_streaming_integration(self):
+        """AgentLoop integration: emitter receives events during execution."""
+        from src.loop_engine import AgentLoop, LoopConfig, ToolLoop
+        from src.tool_registry import ToolRegistry
+
+        # Mock LLM that returns a simple plan
+        class StreamTestLLM:
+            async def chat(self, messages, **kwargs):
+                from src.loop_engine import LLMResponse
+                import json
+                return LLMResponse(
+                    content=json.dumps([
+                        {"description": "Say hello", "tool": None,
+                         "params": {}, "output_key": None},
+                    ]),
+                    model="mock",
+                )
+
+            async def embed(self, text):
+                return [[0.0]]
+
+        emitter = ProgressEmitter("agent-loop-stream")
+        q = await emitter.subscribe()
+
+        config = LoopConfig(max_agent_steps=3)
+        llm = StreamTestLLM()
+        tool_loop = ToolLoop(ToolRegistry(), config)
+
+        agent = AgentLoop(
+            tool_loop=tool_loop,
+            llm=llm,
+            config=config,
+            emitter=emitter,
+        )
+
+        result = await agent.run(
+            agent_id="stream-test",
+            task_scope="Simple test",
+            context={"task_id": "st-1"},
+            allowed_tools=[],
+        )
+
+        # Should have received phase_start and phase_done events
+        events = []
+        while not q.empty():
+            events.append(q.get_nowait())
+
+        event_types = {ev.type for ev in events}
+        assert "phase_start" in event_types or "phase_done" in event_types
+        # At minimum, some events were emitted
+        assert len(events) > 0
