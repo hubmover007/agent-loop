@@ -185,13 +185,17 @@ class AgentLoop:
     def __init__(self, tool_loop: ToolLoop, llm: LLMProvider, config: LoopConfig,
                  agent_soul: Any | None = None,
                  interaction_hub: Any | None = None,
-                 mailbox: Any | None = None):
+                 mailbox: Any | None = None,
+                 evolution: Any | None = None,
+                 emitter: Any | None = None):
         self.tool_loop = tool_loop
         self.llm = llm
         self.config = config
         self.agent_soul = agent_soul  # Optional AgentSoul for EVOLVE
         self.interaction_hub = interaction_hub  # Optional Human-in-the-Loop hub
         self.mailbox = mailbox  # Optional AgentMailbox for inter-agent comms
+        self.evolution = evolution  # Optional EvolutionEngine for structured EVOLVE
+        self.emitter = emitter  # Optional ProgressEmitter for streaming
 
     async def run(self, agent_id: str, task_scope: str, context: dict,
                   allowed_tools: list[str]) -> TaskResult:
@@ -212,12 +216,20 @@ class AgentLoop:
 
         logger.info("AgentLoop[%s] started: %s", agent_id, task_scope[:50])
 
+        # Phase emission helper (called inline, non-blocking)
+        def _emit(ev_type, phase, msg, **kw):
+            if self.emitter:
+                self.emitter.emit(ev_type, phase, msg, **kw)
+
         try:
             # Phase 1: PLAN
+            _emit("phase_start", "PLAN", f"Starting plan for: {task_scope[:80]}")
             plan = await self._plan(task_scope, context)
             steps.append(StepLog(step=0, action="plan", tool_name=None, output=plan))
+            _emit("phase_done", "PLAN", f"Plan generated: {len(plan)} steps")
 
             # Phase 2: EXECUTE
+            _emit("phase_start", "EXECUTE", f"Executing {len(plan)} steps")
             step_num = 1
             for action in plan:
                 if step_num > self.config.max_agent_steps:
@@ -237,6 +249,8 @@ class AgentLoop:
                         tool_cmd = f"{tool_name} {action_desc}"
                         risk = detect_risk_level(tool_cmd)
                         if risk and RISK_LEVEL_ORDER.get(risk, 0) >= RISK_LEVEL_ORDER.get(self.interaction_hub._risk_threshold, 1):
+                            _emit("approval_needed", "EXECUTE",
+                                  f"Approval needed: {tool_name}", risk_level=risk)
                             try:
                                 approval = await self.interaction_hub.request_approval(
                                     agent_id=agent_id,
@@ -271,7 +285,11 @@ class AgentLoop:
                         except Exception:
                             pass  # Mailbox receive timeout is fine
 
+                    _emit("tool_call", "EXECUTE", f"Calling {tool_name}",
+                          step=step_num, params=action.get("params", {}))
                     result = await self.tool_loop.execute(tool_name, **action.get("params", {}))
+                    _emit("tool_call", "EXECUTE", f"{tool_name} returned: {result.status.value}",
+                          step=step_num, status=result.status.value)
                     steps.append(StepLog(
                         step=step_num,
                         action=action.get("description", f"execute {tool_name}"),
@@ -305,10 +323,62 @@ class AgentLoop:
                     ))
                     break
 
-            # Phase 3: SELF_EVAL
-            eval_result = await self._self_evaluate(task_scope, steps, artifacts)
+            _emit("phase_done", "EXECUTE",
+                  f"Execution complete: {len([s for s in steps if s.tool_name])} tool calls")
 
-            # Phase 4: EVOLVE — write JOURNAL.md + update profile.json
+            # Phase 3: SELF_EVAL
+            _emit("phase_start", "SELF_EVAL", "Running self-evaluation")
+            eval_result = await self._self_evaluate(task_scope, steps, artifacts)
+            _emit("phase_done", "SELF_EVAL", f"Self-eval score: {eval_result:.2f}")
+
+            # Phase 4: EVOLVE — structured evolution + legacy journal
+            _emit("phase_start", "EVOLVE", f"Starting evolution (score={eval_result:.2f})")
+
+            # ── Structured evolution (EvolutionEngine) ──
+            if self.evolution:
+                try:
+                    from ..evolution import JournalEntry as JEntry
+                    import uuid as _uuid
+                    from datetime import timezone as _tz, datetime as _dt
+
+                    tools_used = list(set(
+                        s.tool_name for s in steps if s.tool_name
+                    ))
+                    duration = (_dt.now(_tz.utc) - started_at).total_seconds()
+
+                    task_type = "coding" if any(kw in task_scope.lower()
+                        for kw in ["code", "debug", "implement", "refactor", "pull"]) \
+                        else "reasoning" if any(kw in task_scope.lower()
+                        for kw in ["reason", "analyze", "plan", "think"]) \
+                        else "ops" if any(kw in task_scope.lower()
+                        for kw in ["deploy", "ssh", "docker", "server"]) \
+                        else "general"
+
+                    outcome = "success" if eval_result >= self.config.accept_threshold else \
+                        "partial" if eval_result >= self.config.accept_threshold * 0.7 else "failure"
+
+                    entry = JEntry(
+                        id=f"entry:{_uuid.uuid4().hex[:8]}",
+                        timestamp=_dt.now(_tz.utc).isoformat(),
+                        task_scope=task_scope,
+                        task_type=task_type,
+                        outcome=outcome,
+                        score=round(eval_result, 2),
+                        duration_seconds=duration,
+                        tools_used=tools_used,
+                        llm_provider=getattr(self.llm, "model", "unknown"),
+                        cost_estimate=duration * 0.001,
+                        lessons=[s.error for s in steps if s.error] if outcome == "failure" else [],
+                        tags=[task_type, outcome],
+                    )
+                    await self.evolution.record_entry(entry)
+                    await self.evolution.adjust_traits(entry)
+                    await self.evolution.extract_knowledge()
+                    logger.debug("AgentLoop[%s]: EVOLVE — structured evolution recorded", agent_id)
+                except Exception as ev:
+                    logger.warning("AgentLoop[%s]: EVOLVE (structured) failed: %s", agent_id, ev)
+
+            # ── Legacy evolution (AgentSoul) for backward compat ──
             if eval_result >= self.config.accept_threshold and self.agent_soul:
                 try:
                     await self.agent_soul.evolve(
@@ -332,6 +402,8 @@ class AgentLoop:
                 except Exception as ev:
                     logger.warning("AgentLoop[%s]: EVOLVE failed: %s", agent_id, ev)
 
+            _emit("phase_done", "EVOLVE", f"Evolution complete")
+
             # Phase 5: SUBMIT (or self-destruct)
             if eval_result >= self.config.accept_threshold:
                 status = TaskStatus.DONE
@@ -343,6 +415,7 @@ class AgentLoop:
                 logger.warning("AgentLoop[%s]: self-destruct (score=%.2f)", agent_id, eval_result)
 
         except Exception as e:
+            _emit("error", "EXECUTE", f"Agent error: {e}", error=str(e))
             status = TaskStatus.FAILED
             summary = f"Agent error: {e}"
             artifacts = {}

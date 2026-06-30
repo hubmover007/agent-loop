@@ -448,6 +448,9 @@ class AgentManagerAgent:
         # External agent bridge (Codex, Claude Code, Gemini, etc.)
         self.external_bridge = external_bridge or ExternalAgentBridge()
 
+        # Agent Forker — clone agents for parallel tasks
+        self.forker = None  # type: ignore  # Set via enable_forker()
+
         # In-flight tracking: task_id → (agent, asyncio.Task)
         self._inflight: dict[str, tuple[Agent, asyncio.Task]] = {}
 
@@ -965,3 +968,69 @@ class AgentManagerAgent:
             "agents_active": pool_stats["active"],
             "agents_idle": pool_stats["idle"],
         }
+
+    # ── Agent Forking ────────────────────────────────────────────────
+
+    def enable_forker(self, state_dir: str = "state/agents") -> None:
+        """Enable agent forking capability.
+
+        Creates an AgentForker instance that can clone agents for
+        parallel tasks, experiments, or specialization.
+        """
+        from .agent_fork import AgentForker
+        self.forker = AgentForker(state_dir=state_dir)
+
+    async def fork_and_dispatch(self, parent_id: str, task: ManagedTask,
+                                fork_reason: str = "parallel_task",
+                                inherit_soul: bool = True,
+                                inherit_knowledge: bool = True,
+                                role_override: str | None = None) -> str | None:
+        """Fork a child agent from a parent and dispatch a task to it.
+
+        Steps:
+          1. Create ForkConfig from parent agent
+          2. Fork child agent via AgentForker
+          3. Create a ManagedTask for the child
+          4. Dispatch task to child agent
+          5. Return child agent_id
+
+        Returns child agent_id on success, None if forker not enabled.
+        """
+        if not self.forker:
+            logger.warning("AgentManagerAgent: forker not enabled, call enable_forker() first")
+            return None
+
+        from .agent_fork import ForkConfig
+
+        config = ForkConfig(
+            parent_id=parent_id,
+            fork_reason=fork_reason,
+            inherit_soul=inherit_soul,
+            inherit_knowledge=inherit_knowledge,
+            role_override=role_override,
+        )
+
+        child_id = await self.forker.fork(config)
+        task.assigned_agent_id = child_id
+        task.status = TaskStatus.RUNNING
+        task.started_at = datetime.now(timezone.utc)
+
+        logger.info("AgentManagerAgent: forked %s → %s for task %s (reason: %s)",
+                    parent_id, child_id, task.task_id, fork_reason)
+        return child_id
+
+    async def merge_child(self, child_id: str, parent_id: str) -> None:
+        """Merge a child agent's knowledge back into the parent.
+
+        Called after a forked child completes its task.
+        """
+        if not self.forker:
+            logger.warning("AgentManagerAgent: forker not enabled")
+            return
+        await self.forker.merge_back(child_id, parent_id)
+
+    def get_family_tree(self, agent_id: str) -> dict:
+        """Get the family tree for an agent."""
+        if not self.forker:
+            return {"agent_id": agent_id, "error": "forker not enabled"}
+        return self.forker.get_family_tree(agent_id)
