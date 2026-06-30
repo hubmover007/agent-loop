@@ -765,18 +765,112 @@ agent-loop/
 
 ## 七、开发计划
 
-| 阶段 | 内容 | 优先级 |
-|------|------|--------|
-| Phase 0 | SurrealDB Schema + Memory Pool 基础实现 | P0 |
-| Phase 1 | Loop Engine (MainLoop + AgentLoop + ToolLoop) | P0 |
-| Phase 2 | Agent 生命周期管理 (Factory + Pool + Router + Evaluator) | P0 |
-| Phase 3 | TaskTree + TaskScheduler + BranchSpace | P1 |
-| Phase 4 | 图路由检索算法 (graph_route.py) | P1 |
-| Phase 5 | 深度推理混合模式 (deep_reason.py) | P1 |
-| Phase 6 | 工具生态 (SSH + Web + Code + File + MCP) | P2 |
-| Phase 7 | Web UI + API | P2 |
-| Phase 8 | Docker 部署 + 文档 | P2 |
-| Phase 9 | pip install 单机部署 | P2 |
+| 阶段 | 内容 | 优先级 | 状态 |
+|------|------|--------|------|
+| Phase 0 | SurrealDB Schema + Memory Pool 基础实现 | P0 | ✅ Complete |
+| Phase 1 | Loop Engine (MainLoop + AgentLoop + ToolLoop) | P0 | ✅ Complete |
+| Phase 2 | Agent 生命周期管理 (Factory + Pool + Router + Evaluator) | P0 | ✅ Complete |
+| Phase 3 | TaskTree + TaskScheduler + BranchSpace | P1 | ✅ Complete |
+| Phase 4 | 图路由检索算法 (graph_route.py) | P1 | ✅ Complete |
+| Phase 5 | 深度推理混合模式 (deep_reason.py) | P1 | ✅ Complete |
+| Phase 6 | 工具生态 (SSH + Web + Code + File + MCP) | P2 | ✅ Complete |
+| Phase 7 | Web UI + API | P2 | ✅ Complete |
+| Phase 8 | Docker 部署 + 文档 | P2 | ✅ Complete |
+| Phase 9 | pip install 单机部署 | P2 | ✅ Complete |
+| Phase 10 | PermissionChecker 权限系统 | P0 | ✅ Complete |
+| Phase 11 | SandboxManager 沙盒执行 | P0 | ✅ Complete |
+| Phase 12 | Agent 自主修改 + 用户切换 | P1 | ✅ Complete |
+
+---
+
+## 八、新增模块详解
+
+### 8.1 PermissionChecker — 权限系统
+
+**文件**: `src/permissions.py` + `config/permissions.json`
+
+**设计**: 方案 C — 角色模板 + Agent 进化可申请提权 + 高危永远需要确认
+
+**角色模板**:
+| 模板 | trust_level | shell | 网络 | agent_ops |
+|------|-------------|-------|------|-----------|
+| coder | restricted | git/python3/pytest/pip | pypi.org/api.github.com | 可改 own_soul |
+| researcher | untrusted | 禁止 | 允许所有 | 可改 own_soul |
+| ops | trusted | systemctl/docker/kubectl/ssh | 允许所有 | 默认权限 |
+| admin | admin | 全部允许 | 允许所有 | 创建+销毁 agent |
+
+**API**:
+```python
+class AgentPermissions:
+    can_read(path) → bool
+    can_write(path) → bool
+    can_execute(command) → bool
+    can_access_host(host) → bool
+    can_modify_file(file_type) → bool  # identity/role/journal/knowledge/profile
+    request_elevation(reason) → bool
+
+class PermissionChecker:
+    get_permissions(agent_id, template) → AgentPermissions
+    check_operation(agent_id, operation, **kwargs) → bool
+```
+
+**提权机制**:
+- `request_elevation(reason)` — Agent 可申请提权
+- 需 InteractionHub 人类确认
+- 条件: min_tasks_for_elevation=10, min_success_rate=0.7
+
+### 8.2 SandboxManager — 沙盒执行
+
+**文件**: `src/sandbox.py`
+
+**分级**:
+| Level | trust_level | 隔离方式 | shell | 网络 |
+|-------|-------------|----------|-------|------|
+| 0 | untrusted | RestrictedPython / subprocess | 禁止 | 禁止 |
+| 1 | restricted | subprocess + cwd 限制 | 白名单 | 有限 |
+| 2 | trusted | subprocess + timeout | 白名单 | 有限 |
+| 3 | admin | 直接执行 + 审批 | 全部 | 全部 |
+
+**API**:
+```python
+class SandboxManager:
+    async execute_code(code, language, permissions, interaction_hub) → dict
+    async execute_command(command, permissions, interaction_hub) → dict
+```
+
+不依赖 firejail/nsjail，使用 subprocess + cwd + timeout 做基础隔离。
+
+### 8.3 Agent 自主修改 (AgentSoul.self_modify)
+
+**文件**: `src/agent_soul.py` (扩展)
+
+Agent 可以修改自己的文件（需权限检查）：
+- `self_modify(file_type, new_content, permissions)` — 修改 IDENTITY/ROLE/JOURNAL/KNOWLEDGE/profile
+- `request_safety_change(suggestion)` — 建议 SAFETY.md 修改（不能直接改）
+- 全部操作有 audit log 写入 JOURNAL.md
+
+**可修改类型**:
+| file_type | 文件 | 默认权限 |
+|-----------|------|----------|
+| identity | IDENTITY.md | ✅ coder/researcher/admin |
+| role | ROLE.md | ✅ coder/researcher/admin |
+| journal | JOURNAL.md | ✅ 全部模板 |
+| knowledge | KNOWLEDGE.md | ✅ coder/researcher/admin |
+| profile | profile.json | ❌ 默认禁止 |
+
+### 8.4 Agent 切换 (AgentManagerAgent)
+
+**文件**: `src/system_agents.py` (扩展)
+
+新增方法:
+- `list_agents()` — 列出所有 persistent agents
+- `get_active_agent()` — 获取当前 active agent
+- `switch_agent(agent_id)` — 切换 active agent 上下文
+
+切换流程:
+1. 保存当前 agent 的对话上下文
+2. 加载目标 agent 的上下文
+3. 更新 `state/session.json`
 
 ---
 

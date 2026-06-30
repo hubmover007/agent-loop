@@ -231,6 +231,100 @@ class AgentSoul:
         meta["success_rate"] = round(success_count / total, 3) if total > 0 else 0.0
         (self._private_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
+    # ── Self-modification ────────────────────────────────────────────
+
+    async def self_modify(self, file_type: str, new_content: str,
+                         permissions: Any = None) -> bool:
+        """Agent autonomously modifies its own files.
+
+        Full audit trail:
+        1. Permission check: permissions.can_modify_file(file_type)
+        2. Read old content
+        3. Generate diff-like summary
+        4. Write audit log to JOURNAL.md
+        5. Apply new content
+
+        Returns True on success.
+        """
+        # Permission check
+        if permissions is not None:
+            if not permissions.can_modify_file(file_type):
+                logger.warning(
+                    "AgentSoul[%s]: self_modify rejected — insufficient permissions for '%s'",
+                    self.agent_id, file_type,
+                )
+                return False
+
+        # Map file_type to actual file
+        file_map = {
+            "identity": "IDENTITY.md",
+            "role": "ROLE.md",
+            "journal": "JOURNAL.md",
+            "knowledge": "KNOWLEDGE.md",
+            "profile": "profile.json",
+        }
+
+        filename = file_map.get(file_type)
+        if not filename:
+            logger.warning(
+                "AgentSoul[%s]: unknown file_type '%s'",
+                self.agent_id, file_type,
+            )
+            return False
+
+        file_path = self._private_dir / filename
+
+        # Read old content
+        old_content = ""
+        if file_path.exists():
+            old_content = file_path.read_text()
+
+        # Generate summary of change
+        old_len = len(old_content)
+        new_len = len(new_content)
+        diff_summary = (
+            f"Self-modification: {file_type} ({filename})\n"
+            f"  Old size: {old_len} chars → New size: {new_len} chars\n"
+            f"  Change: {'+' if new_len > old_len else '-'}{abs(new_len - old_len)} chars\n"
+        )
+
+        # Write audit log to JOURNAL
+        timestamp = datetime.now(timezone.utc).isoformat()
+        audit_entry = f"\n## {timestamp}\n### 🔄 Self-Modify: {file_type}\n{diff_summary}\n"
+        journal_path = self._private_dir / "JOURNAL.md"
+        with open(journal_path, "a") as f:
+            f.write(audit_entry)
+
+        # Apply new content
+        file_path.write_text(new_content)
+        logger.info(
+            "AgentSoul[%s]: self-modified '%s' (%d → %d chars)",
+            self.agent_id, file_type, old_len, new_len,
+        )
+        return True
+
+    async def request_safety_change(self, suggestion: str) -> None:
+        """Agent suggests a change to SAFETY.md (cannot directly modify).
+
+        The suggestion is written to JOURNAL.md for human review.
+        SAFETY.md has absolute priority and cannot be modified by agents.
+        """
+        timestamp = datetime.now(timezone.utc).isoformat()
+        entry = (
+            f"\n## {timestamp}\n"
+            f"### ⚠️ SAFETY Change Suggestion\n"
+            f"{suggestion}\n"
+            f"_Note: This suggestion was recorded to JOURNAL. "
+            f"SAFETY.md can only be modified by a human._\n"
+        )
+        journal_path = self._private_dir / "JOURNAL.md"
+        with open(journal_path, "a") as f:
+            f.write(entry)
+        logger.info(
+            "AgentSoul[%s]: recorded SAFETY change suggestion",
+            self.agent_id,
+        )
+
     def get_meta(self) -> dict:
         """Get agent metadata."""
         return self._read_private_json("meta.json")

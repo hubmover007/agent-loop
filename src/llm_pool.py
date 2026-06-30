@@ -703,7 +703,19 @@ class LLMPool:
         return [p.to_dict() for p in (self._pool_config.providers if self._pool_config else [])]
 
     async def verify(self, provider_id: str) -> bool:
-        """Test a provider with a real LLM call, mark verified on success."""
+        """Test a provider with a real LLM call, mark verified on success.
+
+        Uses the provider's chat() method (OpenAI client) as primary path.
+        Falls back to direct HTTP (aiohttp/httpx) if the provider's chat() is unavailable.
+
+        Steps:
+          1. Get provider config from pool
+          2. Resolve API Key from environment variable
+          3. Send a simple chat request ("Say hello")
+          4. Success → verified=true, verified_at=now
+          5. Failure → verified=false, log error
+          6. Write results back to config JSON
+        """
         if not self._pool_config:
             self.initialize()
 
@@ -715,26 +727,110 @@ class LLMPool:
         if not cfg:
             raise ValueError(f"Provider '{provider_id}' not found")
 
+        # Try primary: use the provider's chat() method (OpenAI client)
         provider = self._providers.get(provider_id)
         if not provider:
             self._build_providers()
             provider = self._providers.get(provider_id)
-        if not provider:
-            raise RuntimeError(f"Provider '{provider_id}' not available (auth failed?)")
 
+        if provider:
+            try:
+                response = await provider.chat([
+                    {"role": "user", "content": "Reply with only the word: OK"}
+                ])
+                if response and response.content.strip():
+                    cfg.verified = True
+                    cfg.verified_at = datetime.now(timezone.utc).isoformat()
+                    self._pool_config.save(self._config_path)
+                    logger.info("LLMPool: verified provider '%s'", provider_id)
+                    return True
+            except Exception as e:
+                logger.debug("LLMPool: primary verify '%s' failed: %s", provider_id, e)
+
+        # Fallback: direct HTTP verification
+        logger.debug("LLMPool: trying direct HTTP verify for '%s'", provider_id)
+        success, error = await self._verify_via_http(cfg)
+
+        cfg.verified = success
+        cfg.verified_at = datetime.now(timezone.utc).isoformat() if success else None
+        self._pool_config.save(self._config_path)
+
+        if success:
+            logger.info("LLMPool: verified provider '%s' via HTTP", provider_id)
+        else:
+            logger.warning("LLMPool: verify '%s' failed via HTTP: %s", provider_id, error)
+
+        return success
+
+    async def _verify_via_http(self, cfg: ProviderConfigJSON) -> tuple[bool, str | None]:
+        """Verify a provider by making a direct HTTP call to its endpoint.
+
+        Uses httpx if available, aiohttp as fallback.
+
+        Returns (success, error_message).
+        """
+        endpoint = cfg.endpoint.rstrip("/")
+        api_key = self._auth_resolver.resolve(cfg.api_key_source).get("api_key")
+
+        payload = {
+            "model": cfg.model,
+            "messages": [{"role": "user", "content": "Say hello"}],
+            "max_tokens": 10,
+        }
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        # Try httpx first (project dependency)
         try:
-            response = await provider.chat([
-                {"role": "user", "content": "Reply with only the word: OK"}
-            ])
-            if response and response.content.strip():
-                cfg.verified = True
-                cfg.verified_at = datetime.now(timezone.utc).isoformat()
-                self._pool_config.save(self._config_path)
-                logger.info("LLMPool: verified provider '%s'", provider_id)
-                return True
+            import httpx
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    f"{endpoint}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    if content.strip():
+                        return True, None
+                    return False, f"Empty response from {cfg.id}"
+                return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+        except ImportError:
+            pass
         except Exception as e:
-            logger.warning("LLMPool: verify '%s' failed: %s", provider_id, e)
-        return False
+            logger.debug("LLMPool: httpx verify '%s' failed: %s", cfg.id, e)
+
+        # Try aiohttp as fallback
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as session:
+                async with session.post(
+                    f"{endpoint}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        content = (
+                            data.get("choices", [{}])[0]
+                            .get("message", {})
+                            .get("content", "")
+                        )
+                        if content.strip():
+                            return True, None
+                        return False, f"Empty response from {cfg.id}"
+                    text = await resp.text()
+                    return False, f"HTTP {resp.status}: {text[:200]}"
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug("LLMPool: aiohttp verify '%s' failed: %s", cfg.id, e)
+
+        return False, "No HTTP client available (install httpx or aiohttp)"
 
     def get_available(self) -> list[dict]:
         """Return verified + enabled providers list (for AgentManager queries)."""

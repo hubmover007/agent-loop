@@ -136,8 +136,12 @@ def cmd_status(args):
         from src.tools.ssh import SSHTool
         from src.tools.web import WebTool, CodeTool
         from src.web import create_app
+        from src.permissions import PermissionChecker, AgentPermissions
+        from src.sandbox import SandboxManager
 
         print("Modules: all imported ✅")
+        print(f"  + PermissionChecker loaded")
+        print(f"  + SandboxManager loaded")
 
         reg = ToolRegistry()
         reg.register_defaults()
@@ -145,6 +149,96 @@ def cmd_status(args):
     except Exception as e:
         print(f"Import error: {e}")
         sys.exit(1)
+
+
+def cmd_start(args):
+    """Start the full Agent-Loop system."""
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+
+    async def run():
+        from src.memory import MemoryPool
+        from src.llm import create_provider
+        from src.loop_engine import LoopConfig, AgentLoop
+        from src.loop_engine.main_loop import MainLoop
+        from src.system_agents import (
+            TaskAgent, AgentManagerAgent, TaskRegistry,
+        )
+        from src.llm_pool import LLMPool
+        from src.cost_control import CostController
+        from src.interaction import InteractionHub
+        from src.agent_mailbox import MailRouter
+        from src.persistence import PersistenceManager
+        from src.permissions import PermissionChecker
+
+        config_path = Path(args.config or "agent-loop.yaml")
+        memory_url = args.memory_url or "surrealdb://localhost:8000"
+
+        print("=== Agent-Loop Startup ===")
+        print()
+
+        # 1. Load config
+        config = LoopConfig()
+        print("[1/6] Config loaded")
+
+        # 2. Create LLMPool + CostController
+        llm_pool = LLMPool()
+        try:
+            llm_pool.initialize()
+            print(f"[2/6] LLMPool initialized: {len(llm_pool.list_providers())} providers")
+        except Exception as e:
+            print(f"[2/6] LLMPool warning: {e}")
+
+        cost_ctrl = CostController()
+        print("[2/6] CostController initialized")
+
+        # 3. Create PermissionChecker
+        perm_checker = PermissionChecker()
+        print("[3/6] PermissionChecker initialized")
+
+        # 4. Create InteractionHub + MailRouter + PersistenceManager
+        hub = InteractionHub()
+        mail_router = MailRouter()
+        persistence = PersistenceManager()
+        print("[4/6] InteractionHub + MailRouter + PersistenceManager initialized")
+
+        # 5. Create LLM and memory
+        llm = create_provider(
+            args.provider or "deepseek",
+            api_key=args.api_key or os.environ.get("LLM_API_KEY", ""),
+        )
+        memory = MemoryPool(memory_url)
+        print("[5/6] LLM + MemoryPool initialized")
+
+        # 6. Create system agents
+        registry = TaskRegistry()
+        agent_loop = AgentLoop(
+            tool_loop=None,  # will be set up later
+            llm=llm,
+            config=config,
+        )
+        task_agent = TaskAgent(llm=llm, registry=registry)
+        manager = AgentManagerAgent(
+            memory=memory,
+            agent_loop=agent_loop,
+            config=config,
+            registry=registry,
+            llm_pool=llm_pool,
+            interaction_hub=hub,
+            mail_router=mail_router,
+            persistence=persistence,
+        )
+        print("[6/6] TaskAgent + AgentManagerAgent initialized")
+
+        # 7. Show system info
+        print()
+        print("=== System Ready ===")
+        print(f"  Providers: {len(llm_pool.list_providers())}")
+        print(f"  Active agents: {len(manager.list_agents())}")
+        print(f"  Risk threshold: {hub.risk_threshold}")
+        print()
+        print("System is ready for interactive use.")
+
+    asyncio.run(run())
 
 
 def main():
@@ -179,6 +273,14 @@ def main():
     # status
     p_status = sub.add_parser("status", help="Check system status")
     p_status.set_defaults(func=cmd_status)
+
+    # start
+    p_start = sub.add_parser("start", help="Start full Agent-Loop system")
+    p_start.add_argument("--config", default="agent-loop.yaml")
+    p_start.add_argument("--memory-url", default="surrealdb://localhost:8000")
+    p_start.add_argument("--provider", default="deepseek")
+    p_start.add_argument("--api-key", default=None)
+    p_start.set_defaults(func=cmd_start)
 
     args = parser.parse_args()
     if not args.command:

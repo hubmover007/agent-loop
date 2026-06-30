@@ -1,0 +1,88 @@
+{
+  "templates": {
+    "coder": {
+      "trust_level": "restricted",
+      "filesystem": {
+        "read_paths": ["state/**", "config/**", "*.md"],
+        "write_paths": ["state/agents/{agent_id}/**", "/tmp/sandbox/{agent_id}/**"],
+        "blocked_paths": ["~/.aws/**", "~/.openclaw/.env", "/etc/shadow", "~/.ssh/**"]
+      },
+      "network": {
+        "allowed_hosts": ["pypi.org", "api.github.com"],
+        "blocked_hosts": ["*"]
+      },
+      "shell": {
+        "allowed": true,
+        "allowed_commands": ["git", "python3", "pytest", "pip"],
+        "blocked_commands": ["rm", "sudo", "dd", "mkfs", "shutdown"],
+        "timeout_seconds": 30
+      },
+      "agent_ops": {
+        "can_create_agents": false,
+        "can_destroy_agents": false,
+        "can_modify_shared": false,
+        "can_modify_own_soul": true,
+        "can_modify_other_agents": false
+      },
+      "self_modification": {
+        "can_modify_identity": true,
+        "can_modify_role": true,
+        "can_append_journal": true,
+        "can_modify_knowledge": true,
+        "can_modify_profile": false
+      }
+    },
+    "researcher": {
+      "trust_level": "untrusted",
+      "filesystem": {
+        "read_paths": ["state/**", "config/**"],
+        "write_paths": ["state/agents/{agent_id}/**"],
+        "blocked_paths": ["~/.aws/**", "~/.openclaw/.env"]
+      },
+      "network": {
+        "allowed_hosts": ["*"],
+        "blocked_hosts": []
+      },
+      "shell": {
+        "allowed": false
+      },
+      "agent_ops": {
+        "can_modify_own_soul": true,
+        "can_modify_shared": false
+      }
+    },
+    "ops": {
+      "trust_level": "trusted",
+      "filesystem": {
+        "read_paths": ["**"],
+        "write_paths": ["state/**", "/tmp/**"]
+      },
+      "network": {
+        "allowed_hosts": ["*"]
+      },
+      "shell": {
+        "allowed": true,
+        "allowed_commands": ["systemctl", "docker", "kubectl", "ssh", "curl"],
+        "blocked_commands": ["rm -rf /", "dd", "mkfs"],
+        "timeout_seconds": 60
+      }
+    },
+    "admin": {
+      "trust_level": "admin",
+      "filesystem": {"read_paths": ["**"], "write_paths": ["**"]},
+      "network": {"allowed_hosts": ["*"]},
+      "shell": {"allowed": true},
+      "agent_ops": {
+        "can_create_agents": true,
+        "can_destroy_agents": true,
+        "can_modify_shared": true,
+        "can_modify_own_soul": true
+      }
+    }
+  },
+  "elevation": {
+    "requires_approval": true,
+    "min_tasks_for_elevation": 10,
+    "min_success_rate": 0.7
+  }
+}

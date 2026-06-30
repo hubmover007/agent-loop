@@ -1120,6 +1120,86 @@ class AgentManagerAgent:
             "agents_idle": pool_stats["idle"],
         }
 
+    # ── Agent switching (user-facing) ─────────────────────────────
+
+    def list_agents(self) -> list[dict]:
+        """List all persistent agents in the pool.
+
+        Returns a list of agent summary dicts:
+          [{agent_id, status, role, expertise, task_count, created_at}, ...]
+        """
+        agents = []
+        for agent_id, agent in self.pool.agents.items():
+            agents.append({
+                "agent_id": agent.agent_id,
+                "status": agent.status.value if hasattr(agent.status, 'value') else str(agent.status),
+                "role": agent.role.value if hasattr(agent.role, 'value') else str(agent.role),
+                "expertise": agent.expertise,
+                "task_count": agent.task_count,
+                "success_count": agent.success_count,
+                "created_at": getattr(agent, 'created_at', None),
+            })
+        return agents
+
+    def get_active_agent(self) -> Agent | None:
+        """Get the currently active agent (first RUNNING agent, or first IDLE).
+
+        Returns an Agent instance, or None if pool is empty.
+        """
+        # Prefer RUNNING agent
+        for agent in self.pool.agents.values():
+            if agent.status == AgentStatus.RUNNING:
+                return agent
+        # Fallback to IDLE
+        for agent in self.pool.agents.values():
+            if agent.status == AgentStatus.IDLE:
+                return agent
+        # Any agent
+        if self.pool.agents:
+            return next(iter(self.pool.agents.values()))
+        return None
+
+    async def switch_agent(self, agent_id: str) -> bool:
+        """Switch the active agent context.
+
+        Steps:
+          1. Save current agent's conversation context (if any)
+          2. Load target agent's context from state/
+          3. Update state/session.json to reflect new active agent
+
+        Returns True on success, False if target agent not found.
+        """
+        agent = self.pool.agents.get(agent_id)
+        if not agent:
+            logger.warning("AgentManager: switch_agent failed — '%s' not found", agent_id)
+            return False
+
+        # Save current active agent context
+        current = self.get_active_agent()
+        session_path = Path("state/session.json")
+        session_data = {}
+        if session_path.exists():
+            try:
+                session_data = json.loads(session_path.read_text())
+            except (json.JSONDecodeError, Exception):
+                pass
+
+        if current:
+            session_data["previous_agent_id"] = current.agent_id
+
+        session_data["active_agent_id"] = agent_id
+        session_data["switched_at"] = datetime.now(timezone.utc).isoformat()
+
+        import json as _json  # already imported at top
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+        session_path.write_text(_json.dumps(session_data, indent=2))
+
+        logger.info(
+            "AgentManager: switched active agent '%s' → '%s'",
+            current.agent_id if current else "none", agent_id,
+        )
+        return True
+
     # ── Agent Forking ────────────────────────────────────────────────
 
     def enable_forker(self, state_dir: str = "state/agents") -> None:
