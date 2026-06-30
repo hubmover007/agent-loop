@@ -385,6 +385,98 @@ class EvolutionEngine:
                      self.agent_id, nugget.pattern[:60])
         return True
 
+    # ── Archive Old Journal Entries ───────────────────────────
+
+    async def archive_old_entries(self, agent_id: str,
+                                threshold: int = 50) -> str | None:
+        """Archive old JOURNAL entries into a quarterly summary.
+
+        Steps:
+          1. Read existing JOURNAL.md content
+          2. Parse entries by timestamp section headers (## YYYY-MM-DD)
+          3. If entry count <= threshold, return None
+          4. Take oldest entries, generate an archive summary
+          5. Write back: archive summary + recent entries
+          6. Return the archive summary
+
+        Args:
+            agent_id: The agent whose journal to archive
+            threshold: Maximum number of entries before triggering archival
+
+        Returns:
+            The archive summary string, or None if no archival was needed.
+        """
+        journal_path = Path(self.agent_id) / "JOURNAL.md" if not self.journal_path.parent.name == self.agent_id else self.journal_path
+        # Use legacy path from state_dir
+        state_journal = Path("state/agents") / agent_id / "JOURNAL.md"
+
+        # Try both paths
+        actual_path = None
+        for p in [self.journal_path, state_journal]:
+            if p.exists():
+                actual_path = p
+                break
+
+        if not actual_path:
+            logger.debug("EvolutionEngine: no JOURNAL.md found for %s", agent_id)
+            return None
+
+        content = actual_path.read_text()
+        lines = content.split("\n")
+
+        # Parse entries by ## timestamps
+        entries: list[list[str]] = []
+        current: list[str] = []
+        for line in lines:
+            if line.startswith("## ") and line[3] in "0123456789":
+                if current:
+                    entries.append(current)
+                current = [line]
+            else:
+                current.append(line)
+        if current:
+            entries.append(current)
+
+        if len(entries) <= threshold:
+            return None
+
+        # Split old and recent
+        split_idx = len(entries) - max(1, threshold // 2)
+        old_entries = entries[:split_idx]
+        recent_entries = entries[split_idx:]
+
+        # Generate archive summary
+        now = datetime.now(timezone.utc).isoformat()
+        archive_lines = [
+            f"## 归档总结 ({now})",
+            f"",
+            f"*归档了 {len(old_entries)} 条旧日志，保留 {len(recent_entries)} 条最近记录*",
+            "",
+        ]
+        for entry in old_entries:
+            # Extract first meaningful line
+            for line in entry:
+                stripped = line.strip().lstrip("#-* ").strip()
+                if stripped and not stripped.startswith("##"):
+                    archive_lines.append(f"- {stripped[:120]}")
+                    break
+
+        archive_summary = "\n".join(archive_lines)
+
+        # Reconstruct JOURNAL.md: archive summary + recent entries
+        new_content = (
+            archive_summary
+            + "\n\n"
+            + "\n".join("\n".join(e) for e in recent_entries)
+        )
+        actual_path.write_text(new_content)
+
+        logger.info(
+            "EvolutionEngine: archived %d journal entries for %s (threshold=%d)",
+            len(old_entries), agent_id, threshold,
+        )
+        return archive_summary
+
     # ── Statistics ───────────────────────────────────────────────
 
     def get_stats(self) -> dict:

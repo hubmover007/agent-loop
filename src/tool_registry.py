@@ -13,6 +13,7 @@ Key concepts:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -199,20 +200,25 @@ class ToolRegistry:
     # ── Invocation ────────────────────────────────────────────────
 
     async def invoke(self, name: str, args: dict,
-                     interaction_hub=None) -> Any:
-        """Invoke a registered tool.
+                     interaction_hub=None,
+                     max_retries: int = 3,
+                     retry_delay: float = 1.0) -> Any:
+        """Invoke a registered tool with automatic retry on failure.
 
         Flow:
           1. Look up tool — raise ValueError if missing or disabled
           2. Validate args against JSON Schema — raise ValidationError on mismatch
           3. If risk_level >= threshold and interaction_hub exists → request approval
-          4. Call handler
+          4. Call handler with exponential backoff retry on failure
           5. Return result
 
         Args:
             name: Tool name, e.g. "fs.read_file"
             args: Keyword arguments for the handler
             interaction_hub: Optional InteractionHub for human approval gating
+            max_retries: Maximum number of retries on failure (default 3)
+            retry_delay: Initial delay between retries in seconds (default 1.0),
+                doubles on each subsequent retry (exponential backoff)
 
         Returns:
             Whatever the tool handler returns.
@@ -256,15 +262,30 @@ class ToolRegistry:
                         raise
                     logger.warning("ToolRegistry: approval check failed for '%s': %s", name, e)
 
-        # 4. Call handler
-        try:
-            if inspect.iscoroutinefunction(spec.handler):
-                return await spec.handler(**args)
-            else:
-                return spec.handler(**args)
-        except Exception as e:
-            logger.error("ToolRegistry: '%s' handler raised %s", name, type(e).__name__)
-            raise
+        # 4. Call handler with exponential backoff retry
+        last_error: Exception | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                if inspect.iscoroutinefunction(spec.handler):
+                    return await spec.handler(**args)
+                else:
+                    return spec.handler(**args)
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    delay = retry_delay * (2 ** attempt)
+                    logger.warning(
+                        "ToolRegistry: '%s' attempt %d/%d failed (%s), retrying in %.1fs",
+                        name, attempt + 1, max_retries + 1, type(e).__name__, delay,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(
+                        "ToolRegistry: '%s' all %d attempts failed: %s",
+                        name, max_retries + 1, type(e).__name__,
+                    )
+
+        raise last_error  # type: ignore[misc]
 
     # ── Bulk helpers ──────────────────────────────────────────────
 

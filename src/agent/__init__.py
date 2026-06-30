@@ -38,6 +38,9 @@ class Agent:
     process_id: int | None = None
     last_idle_at: datetime | None = None  # Track when agent last became idle
 
+    # Manager reference for delegation
+    _manager: Any = None
+
     async def run(self, agent_loop, task_scope: str, context: dict,
                   allowed_tools: list[str]) -> TaskResult:
         """Execute agent loop for a task."""
@@ -56,6 +59,23 @@ class Agent:
         except Exception:
             self.status = AgentStatus.FAILED
             raise
+
+    async def delegate(self, task_description: str,
+                       role: str | None = None) -> str | None:
+        """Agent proactively delegates a sub-task to a new worker agent.
+
+        Args:
+            task_description: Description of the task to delegate
+            role: Optional specific role requirement for the target agent
+
+        Returns:
+            The child agent_id if delegation succeeded, None otherwise.
+        """
+        if self._manager is not None:
+            return await self._manager.delegate_task(
+                self.agent_id, task_description, role
+            )
+        return None
 
 
 # ============================================================

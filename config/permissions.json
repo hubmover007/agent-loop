@@ -2,6 +2,10 @@
   "templates": {
     "coder": {
       "trust_level": "restricted",
+      "rate_limit": {
+        "max_calls_per_minute": 60,
+        "max_tokens_per_hour": 100000
+      },
       "filesystem": {
         "read_paths": ["state/**", "config/**", "*.md"],
         "write_paths": ["state/agents/{agent_id}/**", "/tmp/sandbox/{agent_id}/**"],
@@ -34,6 +38,10 @@
     },
     "researcher": {
       "trust_level": "untrusted",
+      "rate_limit": {
+        "max_calls_per_minute": 30,
+        "max_tokens_per_hour": 50000
+      },
       "filesystem": {
         "read_paths": ["state/**", "config/**"],
         "write_paths": ["state/agents/{agent_id}/**"],
@@ -53,6 +61,10 @@
     },
     "ops": {
       "trust_level": "trusted",
+      "rate_limit": {
+        "max_calls_per_minute": 120,
+        "max_tokens_per_hour": 200000
+      },
       "filesystem": {
         "read_paths": ["**"],
         "write_paths": ["state/**", "/tmp/**"]
@@ -69,6 +81,10 @@
     },
     "admin": {
       "trust_level": "admin",
+      "rate_limit": {
+        "max_calls_per_minute": 200,
+        "max_tokens_per_hour": 500000
+      },
       "filesystem": {"read_paths": ["**"], "write_paths": ["**"]},
       "network": {"allowed_hosts": ["*"]},
       "shell": {"allowed": true},

@@ -33,20 +33,78 @@ def setup_logging():
         logging.config.dictConfig(config)
     else:
         logging.basicConfig(level=logging.INFO)
-    """Initialize configuration file."""
-    config_path = Path(args.config or "agent-loop.yaml")
-    if config_path.exists():
-        print(f"Config already exists: {config_path}")
-        return
 
-    template = """# Agent-Loop Configuration
+
+def cmd_init_config(args):
+    """Initialize configuration files and directory structure."""
+    config_dir = Path("config")
+    config_dir.mkdir(exist_ok=True)
+
+    # Create agents/ directory structure
+    agents_dir = config_dir / "agents"
+    for sub in ["shared", "cards/personalities", "cards/roles", "private"]:
+        (agents_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    # Create llm_pool.json template if missing
+    llm_pool_path = config_dir / "llm_pool.json"
+    if not llm_pool_path.exists():
+        llm_pool_path.write_text(json.dumps({
+            "providers": {
+                "deepseek": {
+                    "provider": "deepseek",
+                    "api_key": "${DEEPSEEK_API_KEY}",
+                    "model": "deepseek-chat",
+                    "capabilities": ["general", "coding", "reasoning"],
+                    "max_tokens": 8192
+                }
+            },
+            "strategies": {
+                "balanced": {"prefer": "deepseek"},
+                "cheapest": {"prefer": "deepseek"},
+                "most_capable": {"prefer": "deepseek"}
+            }
+        }, indent=2))
+        print(f"Created: {llm_pool_path}")
+
+    # Create permissions.json template if missing
+    perm_path = config_dir / "permissions.json"
+    if not perm_path.exists():
+        perm_path.write_text(json.dumps({
+            "templates": {
+                "coder": {
+                    "trust_level": "restricted",
+                    "filesystem": {
+                        "read_paths": ["state/**", "config/**", "*.md"],
+                        "write_paths": ["state/agents/{agent_id}/**"],
+                        "blocked_paths": ["~/.aws/**", "~/.openclaw/.env"]
+                    },
+                    "network": {"allowed_hosts": ["pypi.org"], "blocked_hosts": ["*"]},
+                    "shell": {"allowed": True, "allowed_commands": ["git", "python3"], "timeout_seconds": 30},
+                    "rate_limit": {"max_calls_per_minute": 60, "max_tokens_per_hour": 100000}
+                },
+                "admin": {
+                    "trust_level": "admin",
+                    "filesystem": {"read_paths": ["**"], "write_paths": ["**"]},
+                    "network": {"allowed_hosts": ["*"]},
+                    "shell": {"allowed": True},
+                    "rate_limit": {"max_calls_per_minute": 200, "max_tokens_per_hour": 500000}
+                }
+            },
+            "elevation": {"requires_approval": True, "min_tasks_for_elevation": 10, "min_success_rate": 0.7}
+        }, indent=2))
+        print(f"Created: {perm_path}")
+
+    # Create agent-loop.yaml template if missing
+    yaml_path = Path(args.config or "agent-loop.yaml")
+    if not yaml_path.exists():
+        yaml_path.write_text("""# Agent-Loop Configuration
 memory:
   url: "surrealdb://localhost:8000"
   namespace: "agent_loop"
   database: "main"
 
 llm:
-  provider: "deepseek"  # deepseek | anthropic-bedrock | openai-compatible
+  provider: "deepseek"
   api_key: "${DEEPSEEK_API_KEY}"
   model: "deepseek-chat"
 
@@ -63,9 +121,10 @@ tools:
 server:
   host: "0.0.0.0"
   port: 8000
-"""
-    config_path.write_text(template)
-    print(f"Config created: {config_path}")
+""")
+        print(f"Created: {yaml_path}")
+
+    print("Agent-Loop config initialized successfully.")
 
 
 def cmd_chat(args):

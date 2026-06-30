@@ -24,6 +24,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,7 @@ class AgentPermissions:
         self._agent_ops: dict[str, bool] = {}
         self._self_mod: dict[str, bool] = {}
         self._elevation_cfg: dict[str, Any] = {}
+        self._call_times: list[float] = []  # Rate limit tracking
         self._load()
 
     def _load(self) -> None:
@@ -249,6 +251,25 @@ class AgentPermissions:
         return self._self_mod.get(key, False)
 
     # ── Elevation ───────────────────────────────────────────────────
+
+    def check_rate_limit(self) -> bool:
+        """Check if the agent has exceeded its rate limit.
+
+        1. Clean up timestamps older than 60 seconds
+        2. Check if current minute's call count exceeds max
+        3. Record this call timestamp if within limit
+
+        Returns True if the call is allowed, False if rate limited.
+        """
+        now = time.time()
+        self._call_times = [t for t in self._call_times if now - t < 60]
+        max_per_min = (
+            self._template.get("rate_limit", {}).get("max_calls_per_minute", 999999)
+        )
+        if len(self._call_times) >= max_per_min:
+            return False
+        self._call_times.append(now)
+        return True
 
     def request_elevation(self, reason: str) -> bool:
         """Request permission elevation (requires InteractionHub approval).

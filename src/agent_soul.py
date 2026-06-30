@@ -136,12 +136,18 @@ class AgentSoul:
 
     # ── System prompt building ─────────────────────────────────────
 
-    def build_system_prompt(self) -> str:
-        """Merge all layers into a system prompt.
+    def build_system_prompt(self,
+                           task_context: dict[str, Any] | None = None) -> str:
+        """Merge all layers into a system prompt, with optional template interpolation.
 
         SAFETY.md MUST appear first.
         Same-layer conflicts: append, don't override.
         Cross-layer conflicts: higher priority wins (already ordered).
+
+        Args:
+            task_context: Optional dict of variables to interpolate into MD files.
+                Variables in {{var}} format in MD content are replaced with values.
+                Example: task_context={"task_type": "coding"} replaces {{task_type}}.
         """
         sections: list[str] = []
 
@@ -183,7 +189,15 @@ class AgentSoul:
                 journal_trimmed = "...(earlier entries truncated)...\n\n" + journal_trimmed[-2000:]
             sections.append(journal_trimmed)
 
-        return "\n\n---\n\n".join(sections)
+        result = "\n\n---\n\n".join(sections)
+
+        # ── Template variable interpolation ──
+        if task_context:
+            for key, value in task_context.items():
+                placeholder = "{{" + key + "}}"
+                result = result.replace(placeholder, str(value))
+
+        return result
 
     # ── Evolution ──────────────────────────────────────────────────
 

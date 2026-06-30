@@ -168,6 +168,90 @@ class MemoryPool:
         return list(result)
 
     # ============================================================
+    # Memory Compression
+    # ============================================================
+
+    async def maybe_compress(self, agent_id: str,
+                            threshold: int = 100,
+                            keep_recent: int = 20) -> str | None:
+        """If an agent's memory exceeds the threshold, compress old entries into a summary.
+
+        Steps:
+          1. Retrieve all memory entries for the agent
+          2. If count <= threshold, return None (no compression needed)
+          3. Take the oldest (total - keep_recent) entries
+          4. Generate a summary from their content
+          5. Delete old entries, save the summary
+          6. Return the summary text
+
+        Args:
+            agent_id: The agent whose memories to compress
+            threshold: Maximum number of memories before triggering compression
+            keep_recent: Number of most recent memories to keep uncompressed
+
+        Returns:
+            The compression summary string, or None if no compression was needed.
+        """
+        collection_key = f"agent_{agent_id}"
+        memories = self._mem.get(collection_key, [])
+
+        if len(memories) <= threshold:
+            return None
+
+        # Separate old and recent
+        split_idx = len(memories) - keep_recent
+        old_memories = memories[:split_idx]
+        recent_memories = memories[split_idx:]
+
+        # Generate summary from old memories
+        summary_lines = ["## 压缩记忆"]
+        for m in old_memories:
+            content = str(m.get("content", ""))[:100]
+            if content:
+                summary_lines.append(f"- {content}")
+        summary = "\n".join(summary_lines)
+
+        # Save summary as a compressed entry
+        import time
+        summary_entry = {
+            "content": summary,
+            "metadata": {"type": "compression_summary", "compressed_count": len(old_memories)},
+            "agent_id": agent_id,
+            "created_at": time.time(),
+        }
+
+        # Persist to SQLite if available
+        if self._sqlite:
+            import json as _json
+            for m in old_memories:
+                mid = m.get("id", "")
+                if mid:
+                    self._sqlite.execute("DELETE FROM memories WHERE id = ?", (mid,))
+            self._sqlite.commit()
+            # Save the summary
+            self._sqlite.execute(
+                "INSERT OR REPLACE INTO memories (id, agent_id, content, metadata, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    f"{collection_key}:compressed:{int(time.time())}",
+                    agent_id,
+                    _json.dumps(summary_entry, default=str),
+                    _json.dumps(summary_entry.get("metadata", {}), default=str),
+                    time.time(),
+                ),
+            )
+            self._sqlite.commit()
+
+        # Update in-memory cache
+        self._mem[collection_key] = recent_memories + [summary_entry]
+
+        logger.info(
+            "MemoryPool: compressed %d memories for %s (threshold=%d, kept=%d)",
+            len(old_memories), agent_id, threshold, keep_recent,
+        )
+        return summary
+
+    # ============================================================
     # Write Operations
     # ============================================================
 

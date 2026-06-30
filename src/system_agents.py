@@ -469,6 +469,63 @@ class AgentManagerAgent:
 
     # ── Persistence: startup restore ───────────────────────────────────
 
+    async def delegate_task(self,
+                            from_agent_id: str,
+                            task_description: str,
+                            required_role: str | None = None) -> str | None:
+        """Agent dynamically delegates a sub-task to a new worker agent.
+
+        Combines existing AgentForker + AgentMailbox to create a child agent
+        and dispatch the delegated task to it.
+
+        Steps:
+          1. Register the delegated task in the registry
+          2. Notify via Mailbox if available
+          3. Assign to a worker agent
+          4. Return the task_id
+
+        Args:
+            from_agent_id: The agent requesting delegation
+            task_description: Human-readable description of the sub-task
+            required_role: Optional role hint for agent selection
+
+        Returns:
+            The task_id of the delegated task, or None on failure.
+        """
+        try:
+            # 1. Register the delegated task
+            task = await self.registry.register(
+                scope=task_description,
+                priority=3,
+                parent_id=from_agent_id,
+                required_tools=[required_role] if required_role else [],
+            )
+
+            # 2. Notify via Mailbox if available
+            if self.mail_router is not None:
+                try:
+                    await self.mail_router.send(
+                        from_agent_id=from_agent_id,
+                        to_agent_id="manager",
+                        subject="delegation_request",
+                        body=task_description,
+                    )
+                except Exception as e:
+                    logger.debug("AgentManager: mailbox send for delegation failed: %s", e)
+
+            # 3. Assign to a worker agent
+            await self.assign(task)
+
+            logger.info(
+                "AgentManager: delegation %s → task %s (role=%s)",
+                from_agent_id, task.task_id, required_role,
+            )
+            return task.task_id
+
+        except Exception as e:
+            logger.error("AgentManager: delegate_task failed: %s", e)
+            return None
+
     async def restore_agents_on_startup(self) -> int:
         """Restore agent states from snapshots on system startup.
 

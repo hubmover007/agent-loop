@@ -431,6 +431,20 @@ class AgentLoop:
                         except Exception:
                             pass  # Mailbox receive timeout is fine
 
+                    # ── Rate limit check ────────────────────────────────────
+                    if (self.agent_permissions is not None
+                            and hasattr(self.agent_permissions, 'check_rate_limit')):
+                        if not self.agent_permissions.check_rate_limit():
+                            await asyncio.sleep(1)
+                            if not self.agent_permissions.check_rate_limit():
+                                steps.append(StepLog(
+                                    step=step_num,
+                                    action=f"blocked: {tool_name}",
+                                    tool_name=tool_name,
+                                    error="Rate limit exceeded",
+                                ))
+                                break
+
                     _emit("tool_call", "EXECUTE", f"Calling {tool_name}",
                           step=step_num, params=action.get("params", {}))
 
