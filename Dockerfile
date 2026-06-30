@@ -2,18 +2,23 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install SurrealDB
-RUN apt-get update && apt-get install -y --no-install-recommends curl && \
-    curl -sSf https://install.surrealdb.com | sh && \
-    mv /root/.surrealdb/surreal /usr/local/bin/surreal && \
-    apt-get remove -y curl && apt-get autoremove -y && \
+# 系统依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ make && \
     rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml .
-RUN pip install --no-cache-dir -e .
+# 复制项目
+COPY . /app/
 
-COPY src/ src/
+# 安装
+RUN pip install --no-cache-dir -e ".[all]"
 
-EXPOSE 8080
+# 创建必要目录
+RUN mkdir -p logs state/agents config
 
-CMD ["agent-loop", "serve"]
+# 初始化配置
+RUN python3 -m src.cli init-config || true
+
+EXPOSE 8000
+
+CMD ["agent-loop", "start"]

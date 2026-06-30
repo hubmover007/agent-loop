@@ -1,0 +1,24 @@
+# Agent-Loop Configuration
+memory:
+  url: "surrealdb://localhost:8000"
+  namespace: "agent_loop"
+  database: "main"
+
+llm:
+  provider: "deepseek"
+  api_key: "${DEEPSEEK_API_KEY}"
+  model: "deepseek-chat"
+
+loop:
+  max_reason_loops: 8
+  reason_confidence_threshold: 0.85
+  max_agent_concurrent: 10
+  accept_threshold: 0.7
+
+tools:
+  brave_api_key: "${BRAVE_API_KEY}"
+  code_workspace: "/tmp/agent_loop/workspace"
+
+server:
+  host: "0.0.0.0"
+  port: 8000

@@ -2,6 +2,34 @@
 
 > Loop Engine for AI Agent orchestration — shared memory, auto task decomposition, agent lifecycle management.
 
+## Quick Start
+
+### 一键安装
+
+```bash
+git clone https://github.com/hubmover007/agent-loop.git
+cd agent-loop
+bash install.sh
+```
+
+### Docker 部署
+
+```bash
+docker-compose up -d
+```
+
+### 手动安装
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+python3 -m src.cli init-config
+agent-loop start
+```
+
+---
+
 ## 核心理念
 
 以 **Loop Engine** 为心脏，**共享记忆** 为大脑，**Agent 生命循环** 为四肢，

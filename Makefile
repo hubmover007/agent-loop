@@ -1,8 +1,7 @@
 .PHONY: install test test-quick test-cov lint run clean
 
 install:
-	pip install -r requirements.txt
-	pip install -r requirements-dev.txt
+	pip install -e ".[dev]"
 
 test:
 	python3 -m pytest tests/ -v
