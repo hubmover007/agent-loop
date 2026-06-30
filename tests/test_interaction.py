@@ -14,7 +14,7 @@ class TestRiskDetection:
 
     def test_detect_rm_command(self):
         assert detect_risk_level("rm -rf /tmp") == "critical"
-        assert detect_risk_level("rm /var/log/app.log") == "critical"
+        assert detect_risk_level("rm /var/log/app.log") == "high"
 
     def test_detect_delete_command(self):
         assert detect_risk_level("delete from users") == "high"

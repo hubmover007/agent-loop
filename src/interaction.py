@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 HIGH_RISK_PATTERNS: list[tuple[str, str]] = [
-    ("rm", "critical"),
+    ("rm -rf", "critical"),
+    ("rm", "high"),
     ("delete", "high"),
     ("drop", "critical"),
     ("kill", "high"),

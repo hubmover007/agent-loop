@@ -414,7 +414,6 @@ class AgentManagerAgent:
                  external_bridge: ExternalAgentBridge | None = None,
                  llm_pool: Any | None = None,
                  state_store: Any | None = None,
-                 template_registry: AgentTemplateRegistry | None = None,
                  interaction_hub: Any | None = None,
                  mail_router: Any | None = None,
                  persistence: Any | None = None):
@@ -438,9 +437,8 @@ class AgentManagerAgent:
         # PersistenceManager — cross-session state persistence
         self.persistence = persistence
 
-        # Agent template registry — JSON/YAML driven, no free-form LLM selection
-        self.template_registry = template_registry or AgentTemplateRegistry()
-        self.template_registry.load()
+        # Central event bus for progress events across all agents
+        self._event_bus: asyncio.Queue = asyncio.Queue()
 
         # Internal agent pool
         self.pool = AgentPool(max_concurrent=config.max_agent_concurrent)
@@ -582,15 +580,22 @@ class AgentManagerAgent:
         return True
 
     async def _acquire_worker(self, task: ManagedTask) -> Agent | None:
-        """Find idle agent or create new one.
+        """Find idle agent or create new one with autonomous decision-making.
 
-        Uses AgentTemplateRegistry to determine which template fits the task,
-        then uses LLMPool to select the appropriate LLM provider per template spec.
-        All selection is driven by config/agent_templates.yaml + config/llm_pool.yaml,
-        never by free-form LLM inference.
+        The AgentManagerAgent autonomously decides:
+          1. Task type classification (coding/reasoning/ops/general)
+          2. Personality + role from cards/
+          3. Build AgentSoul via SoulBuilder
+          4. Select LLM provider via LLMPool
+          5. Create ProgressEmitter for streaming
+
+        All decisions are rule-driven (no LLM inference), ensuring fast and
+        deterministic agent creation.
         """
-        # Infer template from task (config-driven, not LLM-driven)
-        template = self.template_registry.infer_template(task)
+        task_type = self._classify_task(task)
+        personality = self._choose_personality(task_type)
+        role = self._choose_role(task_type)
+        llm_strategy = self._choose_llm_strategy(task_type)
 
         # Try to reuse idle agent with matching expertise
         for agent in self.pool.agents.values():
@@ -603,37 +608,103 @@ class AgentManagerAgent:
             return None
 
         agent.role = AgentRole.WORKER
-        agent.expertise = task.required_tools or template.llm_capabilities_required
+        agent.expertise = task.required_tools or []
 
-        # Structured LLM selection: template spec → llm_pool strategy
-        # This is system-level config resolution, not LLM-driven
+        # ── Build AgentSoul ──────────────────────────────────────
+        from .agent_soul import SoulBuilder
+        try:
+            soul = SoulBuilder(agent_id=agent.agent_id)\
+                .with_personality(personality)\
+                .with_role(role)\
+                .build()
+            agent._agent_soul = soul
+            logger.info("AgentManager: agent %s bound to soul (%s/%s)",
+                       agent.agent_id, personality, role)
+        except Exception as e:
+            logger.warning("AgentManager: soul build failed for %s: %s", agent.agent_id, e)
+
+        # ── Create ProgressEmitter ───────────────────────────────
+        from .streaming import ProgressEmitter
+        emitter = ProgressEmitter(agent_id=agent.agent_id)
+        # Subscribe to forward events to the central event bus
+        emitter.on_event(lambda ev: self._event_bus.put_nowait(ev))
+        agent._progress_emitter = emitter
+
+        # ── Bind EvolutionEngine ─────────────────────────────────
+        from .evolution import EvolutionEngine
+        agent._evolution_engine = EvolutionEngine(agent_id=agent.agent_id)
+
+        # ── Structured LLM selection via LLMPool ─────────────────
         if self.llm_pool:
             try:
                 provider = await self.llm_pool.acquire(
-                    capabilities=template.llm_capabilities_required,
-                    strategy=template.llm_strategy,
+                    capabilities=self._infer_capabilities(task),
+                    strategy=llm_strategy,
                 )
                 # Bind LLM provider to agent for use in AgentLoop
                 agent._llm_provider = provider
                 agent._llm_provider_id = provider.provider_id
-                agent._template_name = template.name
+                agent._task_type = task_type
                 logger.info(
-                    "AgentManager: agent %s bound to provider '%s' via template '%s' (strategy=%s)",
-                    agent.agent_id, provider.provider_id, template.name, template.llm_strategy
+                    "AgentManager: agent %s bound to provider '%s' (task_type=%s, strategy=%s)",
+                    agent.agent_id, provider.provider_id, task_type, llm_strategy
                 )
             except Exception as e:
                 logger.warning(
-                    "AgentManager: llm_pool acquire failed for template '%s': %s — using default LLM",
-                    template.name, e
+                    "AgentManager: llm_pool acquire failed for task_type='%s': %s — using default LLM",
+                    task_type, e
                 )
 
-        # Apply template limits to AgentLoop config
-        if template.max_steps != self.config.max_agent_steps:
-            agent._max_steps_override = template.max_steps
-        if template.ttl != self.config.agent_ttl:
-            agent._ttl_override = template.ttl
-
         return agent
+
+    # ── Autonomous decision helpers (rule-driven, no LLM) ────────
+
+    @staticmethod
+    def _classify_task(task: ManagedTask) -> str:
+        """Infer task type from task.scope and required_tools.
+
+        Returns one of: 'coding', 'reasoning', 'ops', 'general'.
+        """
+        scope = (task.scope or "").lower()
+        tools = [t.lower() for t in (task.required_tools or [])]
+
+        if any(k in scope for k in ["code", "implement", "debug", "refactor", "build"]):
+            return "coding"
+        if any(k in scope for k in ["analyze", "reason", "compare", "evaluate"]):
+            return "reasoning"
+        if any(k in scope for k in ["deploy", "restart", "check", "monitor"]):
+            return "ops"
+        return "general"
+
+    @staticmethod
+    def _choose_personality(task_type: str) -> str:
+        """Select personality card based on task type."""
+        return {
+            "coding": "executor",
+            "reasoning": "analyst",
+            "ops": "guardian",
+            "general": "executor",
+        }.get(task_type, "executor")
+
+    @staticmethod
+    def _choose_role(task_type: str) -> str:
+        """Select role card based on task type."""
+        return {
+            "coding": "coder",
+            "reasoning": "researcher",
+            "ops": "ops",
+            "general": "coder",
+        }.get(task_type, "coder")
+
+    @staticmethod
+    def _choose_llm_strategy(task_type: str) -> str:
+        """Select LLM strategy based on task type."""
+        return {
+            "reasoning": "most_capable",
+            "coding": "cheapest",
+            "ops": "balanced",
+            "general": "balanced",
+        }.get(task_type, "balanced")
 
     # _infer_capabilities is kept for backward compat but template_registry is preferred
     @staticmethod
@@ -707,9 +778,10 @@ class AgentManagerAgent:
             if self.mail_router is not None:
                 agent_mailbox = self.mail_router.register(agent.agent_id)
 
-            # Use agent-bound LLM if available (from llm_pool + template selection)
+            # Use agent-bound LLM if available (from llm_pool + autonomous selection)
             # Otherwise fall back to the shared agent_loop with its default LLM
             bound_llm = getattr(agent, "_llm_provider", None)
+            agent_emitter = getattr(agent, "_progress_emitter", None)
             if bound_llm is not None:
                 from .loop_engine import AgentLoop as _AgentLoop
                 dedicated_loop = _AgentLoop(
@@ -718,18 +790,21 @@ class AgentManagerAgent:
                     config=self.config,
                     interaction_hub=self.interaction_hub,
                     mailbox=agent_mailbox,
+                    emitter=agent_emitter,
                 )
-                # Apply per-agent step/TTL overrides from template
-                if hasattr(agent, "_max_steps_override"):
-                    dedicated_loop.config = type(self.config)(
-                        **{**self.config.__dict__,
-                           "max_agent_steps": agent._max_steps_override,
-                           "agent_ttl": getattr(agent, "_ttl_override", self.config.agent_ttl)}
-                    )
                 result = await agent.run(dedicated_loop, task.scope, context,
                                         allowed_tools=task.required_tools)
             else:
-                result = await agent.run(self.agent_loop, task.scope, context,
+                # Still pass the emitter to the shared loop
+                loop_with_emitter = type(self.agent_loop)(
+                    tool_loop=self.agent_loop.tool_loop,
+                    llm=self.agent_loop.llm,
+                    config=self.config,
+                    interaction_hub=self.interaction_hub,
+                    mailbox=agent_mailbox,
+                    emitter=agent_emitter,
+                )
+                result = await agent.run(loop_with_emitter, task.scope, context,
                                         allowed_tools=task.required_tools)
 
             # Unregister mailbox after agent completes
@@ -741,6 +816,38 @@ class AgentManagerAgent:
             # Evaluate quality
             eval_result = self.evaluator.evaluate(result, task.scope)
             task.evaluation = eval_result
+
+            # ── Evolution: record structured journal entry ──────
+            evolution_engine = getattr(agent, '_evolution_engine', None)
+            if evolution_engine:
+                from src.evolution import JournalEntry
+                import uuid as _uuid
+                elapsed = (datetime.now(timezone.utc) - task.started_at).total_seconds() if task.started_at else 0.0
+                task_type = getattr(agent, '_task_type', self._classify_task(task))
+                entry = JournalEntry(
+                    id=str(_uuid.uuid4()),
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    task_scope=task.scope,
+                    task_type=task_type,
+                    outcome="success" if eval_result.action == "accept" else "failure",
+                    score=eval_result.overall if hasattr(eval_result, 'overall') else 0.8,
+                    duration_seconds=elapsed,
+                    tools_used=task.required_tools or [],
+                    llm_provider=getattr(agent, '_llm_provider_id', 'unknown'),
+                    cost_estimate=getattr(result, 'cost_estimate', 0.0) if hasattr(result, 'cost_estimate') else 0.0,
+                    lessons=[],
+                    tags=[],
+                )
+                try:
+                    await evolution_engine.record_entry(entry)
+                    await evolution_engine.adjust_traits(entry)
+                    stats = evolution_engine.get_stats()
+                    if stats.get('total_tasks', 0) % 5 == 0:
+                        await evolution_engine.extract_knowledge()
+                    logger.debug("AgentManager: evolution recorded for %s (%s, score=%.2f)",
+                               task.task_id, entry.outcome, entry.score)
+                except Exception as e:
+                    logger.warning("AgentManager: evolution recording failed: %s", e)
 
             if eval_result.action == "accept":
                 # Accept: commit to mainline

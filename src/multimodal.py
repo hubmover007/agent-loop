@@ -111,6 +111,14 @@ class MultimodalProcessor:
         blocks: list[dict] = []
         for media in inputs:
             try:
+                # Accept both MediaInput objects and dicts
+                if isinstance(media, dict):
+                    media = MediaInput(
+                        type=media.get("type", "text"),
+                        source=media.get("content", media.get("source", "")),
+                        mime_type=media.get("mime_type", ""),
+                        description=media.get("description", ""),
+                    )
                 if media.type == "text":
                     blocks.append(media.to_openai_content())
                 elif media.type == "image":
