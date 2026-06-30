@@ -385,7 +385,8 @@ class PoolManagedProvider(LLMProvider):
     def __init__(self, cfg: ProviderConfigJSON, api_key: str | None,
                  semaphore: asyncio.Semaphore,
                  circuit_breaker: CircuitBreaker,
-                 tracker: PoolTracker):
+                 tracker: PoolTracker,
+                 cost_controller: Any | None = None):
         self.provider_id = cfg.id
         self._cfg = cfg
         self._api_key = api_key or "not-needed"
@@ -396,6 +397,7 @@ class PoolManagedProvider(LLMProvider):
         self._semaphore = semaphore
         self._cb = circuit_breaker
         self._tracker = tracker
+        self._cost_controller = cost_controller
         self._client: Any = None
 
     def _ensure_client(self):
@@ -424,6 +426,21 @@ class PoolManagedProvider(LLMProvider):
         output_tokens = 0
         error_msg = None
         model = kwargs.pop("model", None) or self._model
+
+        # ── Cost check (before call, optional) ────────────────
+        if self._cost_controller:
+            # Estimate cost from config rates + estimated tokens
+            estimated = (
+                self._cfg.cost_per_1m_input * 0.001 +
+                self._cfg.cost_per_1m_output * 0.002
+            )  # rough estimate ~1k input + 2k output
+            if not self._cost_controller.check(estimated):
+                remaining = self._cost_controller.get_remaining()
+                raise RuntimeError(
+                    f"CostController: budget exceeded. "
+                    f"Daily: ${remaining['daily_spent']:.2f}/${remaining['daily_limit']:.2f}, "
+                    f"Monthly: ${remaining['monthly_spent']:.2f}/${remaining['monthly_limit']:.2f}"
+                )
 
         try:
             async with self._semaphore:
@@ -455,6 +472,18 @@ class PoolManagedProvider(LLMProvider):
             raise
         finally:
             latency_ms = (time.monotonic() - start) * 1000
+            # ── Cost record (after call, optional) ────────────
+            if self._cost_controller and success:
+                actual_cost = (
+                    self._cfg.cost_per_1m_input * input_tokens / 1_000_000 +
+                    self._cfg.cost_per_1m_output * output_tokens / 1_000_000
+                )
+                self._cost_controller.record(
+                    actual_cost=actual_cost,
+                    provider_id=self.provider_id,
+                    tokens_in=input_tokens,
+                    tokens_out=output_tokens,
+                )
             await self._tracker.record(UsageRecord(
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 provider_id=self.provider_id,
@@ -484,7 +513,8 @@ class LLMPool:
     """Multi-provider LLM pool with JSON config + strategy-based selection."""
 
     def __init__(self, config_path: str | Path = "config/llm_pool.json",
-                 state_dir: str | Path = "state"):
+                 state_dir: str | Path = "state",
+                 cost_controller: Any | None = None):
         self._config_path = Path(config_path)
         self._state_dir = Path(state_dir)
         self._pool_config: PoolConfigJSON | None = None
@@ -495,6 +525,7 @@ class LLMPool:
         self._tracker = PoolTracker(
             usage_log_path=self._state_dir / "llm_pool" / "usage.jsonl"
         )
+        self._cost_controller = cost_controller
         self._initialized = False
 
     def initialize(self) -> None:
@@ -526,6 +557,7 @@ class LLMPool:
             self._providers[cfg.id] = PoolManagedProvider(
                 cfg=cfg, api_key=api_key,
                 semaphore=sem, circuit_breaker=cb, tracker=self._tracker,
+                cost_controller=self._cost_controller,
             )
 
     # ── Selection ──────────────────────────────────────────────────
@@ -603,7 +635,8 @@ class LLMPool:
 
     async def acquire(self, capabilities: list[str] | None = None,
                       strategy: str | None = None,
-                      task_type: str | None = None) -> PoolManagedProvider:
+                      task_type: str | None = None,
+                      cost_controller: Any | None = None) -> PoolManagedProvider:
         """Acquire the best matching provider."""
         if not self._initialized:
             self.initialize()

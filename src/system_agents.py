@@ -414,7 +414,9 @@ class AgentManagerAgent:
                  external_bridge: ExternalAgentBridge | None = None,
                  llm_pool: Any | None = None,
                  state_store: Any | None = None,
-                 template_registry: AgentTemplateRegistry | None = None):
+                 template_registry: AgentTemplateRegistry | None = None,
+                 interaction_hub: Any | None = None,
+                 mail_router: Any | None = None):
         self.memory = memory
         self.agent_loop = agent_loop
         self.config = config
@@ -425,6 +427,12 @@ class AgentManagerAgent:
 
         # Optional StateStore for structured persistence
         self.state_store = state_store
+
+        # Human-in-the-Loop hub — single instance for all agents
+        self.interaction_hub = interaction_hub
+
+        # Agent-to-Agent MailRouter — single instance for all agents
+        self.mail_router = mail_router
 
         # Agent template registry — JSON/YAML driven, no free-form LLM selection
         self.template_registry = template_registry or AgentTemplateRegistry()
@@ -653,6 +661,11 @@ class AgentManagerAgent:
                 "llm_provider_id": getattr(agent, "_llm_provider_id", None),
             }
 
+            # Register mailbox for this agent if router is available
+            agent_mailbox = None
+            if self.mail_router is not None:
+                agent_mailbox = self.mail_router.register(agent.agent_id)
+
             # Use agent-bound LLM if available (from llm_pool + template selection)
             # Otherwise fall back to the shared agent_loop with its default LLM
             bound_llm = getattr(agent, "_llm_provider", None)
@@ -662,6 +675,8 @@ class AgentManagerAgent:
                     tool_loop=self.agent_loop.tool_loop,
                     llm=bound_llm,
                     config=self.config,
+                    interaction_hub=self.interaction_hub,
+                    mailbox=agent_mailbox,
                 )
                 # Apply per-agent step/TTL overrides from template
                 if hasattr(agent, "_max_steps_override"):
@@ -675,6 +690,10 @@ class AgentManagerAgent:
             else:
                 result = await agent.run(self.agent_loop, task.scope, context,
                                         allowed_tools=task.required_tools)
+
+            # Unregister mailbox after agent completes
+            if self.mail_router is not None:
+                self.mail_router.unregister(agent.agent_id)
 
             branch.log("task_completed", {"summary": result.summary})
 

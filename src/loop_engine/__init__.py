@@ -183,11 +183,15 @@ class AgentLoop:
     """Level 2: Individual agent execution loop."""
 
     def __init__(self, tool_loop: ToolLoop, llm: LLMProvider, config: LoopConfig,
-                 agent_soul: Any | None = None):
+                 agent_soul: Any | None = None,
+                 interaction_hub: Any | None = None,
+                 mailbox: Any | None = None):
         self.tool_loop = tool_loop
         self.llm = llm
         self.config = config
         self.agent_soul = agent_soul  # Optional AgentSoul for EVOLVE
+        self.interaction_hub = interaction_hub  # Optional Human-in-the-Loop hub
+        self.mailbox = mailbox  # Optional AgentMailbox for inter-agent comms
 
     async def run(self, agent_id: str, task_scope: str, context: dict,
                   allowed_tools: list[str]) -> TaskResult:
@@ -226,6 +230,47 @@ class AgentLoop:
                 # Check if this step requires a tool call
                 tool_name = action.get("tool")
                 if tool_name and tool_name in allowed_tools:
+                    # ── Human-in-the-Loop: check high-risk operations ─────
+                    if self.interaction_hub is not None:
+                        from ..interaction import detect_risk_level, RISK_LEVEL_ORDER
+                        action_desc = action.get("description", "") or str(action.get("params", {}))
+                        tool_cmd = f"{tool_name} {action_desc}"
+                        risk = detect_risk_level(tool_cmd)
+                        if risk and RISK_LEVEL_ORDER.get(risk, 0) >= RISK_LEVEL_ORDER.get(self.interaction_hub._risk_threshold, 1):
+                            try:
+                                approval = await self.interaction_hub.request_approval(
+                                    agent_id=agent_id,
+                                    action=f"{tool_name}: {action_desc}",
+                                    details=str(action.get("params", {})),
+                                    risk_level=risk,
+                                    task_scope=task_scope,
+                                )
+                                if approval.status != "approved":
+                                    steps.append(StepLog(
+                                        step=step_num,
+                                        action=f"blocked: {tool_name}",
+                                        tool_name=tool_name,
+                                        error=f"User {approval.status}: {approval.reply}",
+                                    ))
+                                    break
+                            except Exception as e:
+                                logger.warning("AgentLoop[%s]: interaction hub error: %s", agent_id, e)
+
+                    # ── Mailbox: check for incoming messages before step ────
+                    if self.mailbox is not None:
+                        try:
+                            msg = await self.mailbox.receive(timeout=0.5)
+                            if msg and msg.type == "handoff":
+                                steps.append(StepLog(
+                                    step=step_num,
+                                    action=f"handoff from {msg.from_agent}",
+                                    tool_name=None,
+                                    output=msg.body,
+                                ))
+                                logger.info("AgentLoop[%s]: received handoff from %s", agent_id, msg.from_agent)
+                        except Exception:
+                            pass  # Mailbox receive timeout is fine
+
                     result = await self.tool_loop.execute(tool_name, **action.get("params", {}))
                     steps.append(StepLog(
                         step=step_num,
