@@ -416,7 +416,9 @@ class AgentManagerAgent:
                  state_store: Any | None = None,
                  interaction_hub: Any | None = None,
                  mail_router: Any | None = None,
-                 persistence: Any | None = None):
+                 persistence: Any | None = None,
+                 permission_checker: Any | None = None,
+                 sandbox: Any | None = None):
         self.memory = memory
         self.agent_loop = agent_loop
         self.config = config
@@ -436,6 +438,12 @@ class AgentManagerAgent:
 
         # PersistenceManager — cross-session state persistence
         self.persistence = persistence
+
+        # PermissionChecker — agent capability-based access control
+        self.permission_checker = permission_checker
+
+        # SandboxManager — tiered code execution isolation
+        self.sandbox = sandbox
 
         # Central event bus for progress events across all agents
         self._event_bus: asyncio.Queue = asyncio.Queue()
@@ -634,6 +642,22 @@ class AgentManagerAgent:
         from .evolution import EvolutionEngine
         agent._evolution_engine = EvolutionEngine(agent_id=agent.agent_id)
 
+        # ── Bind permissions (PermissionChecker → AgentPermissions) ─
+        if self.permission_checker:
+            try:
+                perms = self.permission_checker.get_permissions(
+                    agent.agent_id, role
+                )
+                agent._permissions = perms
+                logger.info(
+                    "AgentManager: agent %s bound to permissions (template=%s, trust_level=%s)",
+                    agent.agent_id, role, perms.trust_level
+                )
+            except Exception as e:
+                logger.warning(
+                    "AgentManager: permission bind failed for %s: %s", agent.agent_id, e
+                )
+
         # ── Structured LLM selection via LLMPool ─────────────────
         if self.llm_pool:
             try:
@@ -706,7 +730,6 @@ class AgentManagerAgent:
             "general": "balanced",
         }.get(task_type, "balanced")
 
-    # _infer_capabilities is kept for backward compat but template_registry is preferred
     @staticmethod
     def _infer_capabilities(task: ManagedTask) -> list[str]:
         """Infer required LLM capabilities from task scope and required_tools."""
@@ -791,6 +814,8 @@ class AgentManagerAgent:
                     interaction_hub=self.interaction_hub,
                     mailbox=agent_mailbox,
                     emitter=agent_emitter,
+                    sandbox=self.sandbox,
+                    agent_permissions=getattr(agent, '_permissions', None),
                 )
                 result = await agent.run(dedicated_loop, task.scope, context,
                                         allowed_tools=task.required_tools)
@@ -803,6 +828,8 @@ class AgentManagerAgent:
                     interaction_hub=self.interaction_hub,
                     mailbox=agent_mailbox,
                     emitter=agent_emitter,
+                    sandbox=self.sandbox,
+                    agent_permissions=getattr(agent, '_permissions', None),
                 )
                 result = await agent.run(loop_with_emitter, task.scope, context,
                                         allowed_tools=task.required_tools)

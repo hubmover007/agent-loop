@@ -189,7 +189,9 @@ class AgentLoop:
                  evolution: Any | None = None,
                  emitter: Any | None = None,
                  tool_registry: Any | None = None,
-                 multimodal_processor: Any | None = None):
+                 multimodal_processor: Any | None = None,
+                 sandbox: Any | None = None,
+                 agent_permissions: Any | None = None):
         self.tool_loop = tool_loop
         self.llm = llm
         self.config = config
@@ -200,6 +202,8 @@ class AgentLoop:
         self.emitter = emitter  # Optional ProgressEmitter for streaming
         self.tool_registry = tool_registry  # Optional MCP ToolRegistry
         self.multimodal_processor = multimodal_processor  # Optional MultimodalProcessor
+        self.sandbox = sandbox  # Optional SandboxManager for code execution
+        self.agent_permissions = agent_permissions  # Optional AgentPermissions for access control
 
     async def run(self, agent_id: str, task_scope: str, context: dict,
                   allowed_tools: list[str],
@@ -309,7 +313,40 @@ class AgentLoop:
 
                     _emit("tool_call", "EXECUTE", f"Calling {tool_name}",
                           step=step_num, params=action.get("params", {}))
-                    result = await self.tool_loop.execute(tool_name, **action.get("params", {}))
+
+                    # ── Sandbox: code execution tools go through SandboxManager ──
+                    if (self.sandbox is not None
+                            and tool_name in ('code.execute', 'shell.run_command', 'run_code',
+                                             'shell.exec', 'python.exec')):
+                        tool_params = action.get("params", {})
+                        command = tool_params.get('command', tool_params.get('code', ''))
+                        language = tool_params.get('language',
+                            'python' if tool_name in ('run_code', 'python.exec') else 'shell')
+                        try:
+                            sandbox_result = await self.sandbox.execute_command(
+                                command,
+                                permissions=self.agent_permissions,
+                                interaction_hub=self.interaction_hub,
+                            )
+                            if sandbox_result.get('exit_code', -1) != 0:
+                                result = ToolResult(
+                                    status=ToolResultStatus.TRANSIENT_ERROR,
+                                    error=sandbox_result.get('stderr', 'Sandbox execution failed'),
+                                    data=sandbox_result,
+                                )
+                            else:
+                                result = ToolResult(
+                                    status=ToolResultStatus.SUCCESS,
+                                    data=sandbox_result,
+                                )
+                        except Exception as se:
+                            result = ToolResult(
+                                status=ToolResultStatus.TRANSIENT_ERROR,
+                                error=f"Sandbox error: {se}",
+                            )
+                    else:
+                        result = await self.tool_loop.execute(tool_name, **action.get("params", {}))
+
                     _emit("tool_call", "EXECUTE", f"{tool_name} returned: {result.status.value}",
                           step=step_num, status=result.status.value)
                     steps.append(StepLog(
@@ -423,6 +460,29 @@ class AgentLoop:
                     await self.agent_soul.record_task(success=False)
                 except Exception as ev:
                     logger.warning("AgentLoop[%s]: EVOLVE failed: %s", agent_id, ev)
+
+            # ── Self-modification: Agent autonomously adjusts IDENTITY on high scores ──
+            if self.agent_soul and hasattr(self.agent_soul, 'self_modify'):
+                if eval_result > 0.85:
+                    try:
+                        # Only self-modify if permissions allow (or no permissions check)
+                        can_modify = (
+                            self.agent_permissions is None
+                            or self.agent_permissions.can_modify_file('identity')
+                        )
+                        if can_modify:
+                            current = self.agent_soul.identity_content
+                            if 'experience' not in current.lower():
+                                new_content = current + '\n\n## 经验\n积累了成功的执行经验。'
+                                await self.agent_soul.self_modify(
+                                    'identity', new_content, self.agent_permissions
+                                )
+                                logger.debug(
+                                    "AgentLoop[%s]: EVOLVE — self_modify IDENTITY enhanced",
+                                    agent_id
+                                )
+                    except Exception:
+                        pass  # self_modify failure doesn't affect main flow
 
             _emit("phase_done", "EVOLVE", f"Evolution complete")
 

@@ -83,7 +83,7 @@ async def test_full_agent_lifecycle():
         from src.loop_engine import LoopConfig
         config = LoopConfig()
 
-        # Create AgentManagerAgent (no template_registry — autonomous decision)
+        # Create AgentManagerAgent (autonomous decision)
         mgr = AgentManagerAgent(
             memory=MagicMock(),
             agent_loop=mock_loop,
@@ -910,3 +910,273 @@ async def test_multimodal_processor_integration():
     assert len(blocks) == 2
     assert blocks[0]["type"] == "text"
     assert blocks[1]["type"] == "image_url"
+
+
+# ============================================================
+# Test 13: Agent permissions binding (Bug 2 fix)
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_agent_permissions_binding():
+    """AgentManagerAgent._acquire_worker binds permissions from PermissionChecker."""
+    tmp = _temp_dir()
+    try:
+        # Create permissions config for test
+        perm_config_dir = Path(tmp) / "config"
+        perm_config_dir.mkdir(parents=True, exist_ok=True)
+        perm_config = perm_config_dir / "permissions.json"
+        perm_config.write_text(json.dumps({
+            "templates": {
+                "coder": {
+                    "trust_level": "restricted",
+                    "filesystem": {
+                        "read_paths": ["state/agents/{agent_id}/*"],
+                        "write_paths": ["state/agents/{agent_id}/*"],
+                        "blocked_paths": ["/etc/*", "~/.openclaw/*"]
+                    },
+                    "network": {"allowed_hosts": ["api.github.com"], "blocked_hosts": []},
+                    "shell": {
+                        "allowed": True,
+                        "allowed_commands": ["git", "python3", "pytest", "pip"],
+                        "blocked_commands": ["rm", "sudo", "chmod"]
+                    },
+                    "agent_ops": {"can_modify_own_soul": True},
+                    "self_modification": {
+                        "can_modify_identity": True,
+                        "can_modify_role": True,
+                        "can_append_journal": True,
+                        "can_modify_knowledge": True,
+                        "can_modify_profile": False
+                    }
+                }
+            },
+            "elevation": {"requires_approval": True}
+        }))
+
+        from src.permissions import PermissionChecker
+        checker = PermissionChecker(config_path=str(perm_config))
+
+        registry = TaskRegistry()
+        mock_loop = MagicMock()
+        mock_loop.tool_loop = MagicMock()
+        mock_loop.llm = MagicMock()
+        from src.loop_engine import LoopConfig
+        config = LoopConfig()
+
+        mgr = AgentManagerAgent(
+            memory=MagicMock(),
+            agent_loop=mock_loop,
+            config=config,
+            registry=registry,
+            permission_checker=checker,
+        )
+
+        # Register a task
+        task = ManagedTask(
+            task_id=f"task:{uuid.uuid4().hex[:8]}",
+            scope="implement user login",
+            required_tools=["fs.write_file"],
+        )
+        registry._tasks[task.task_id] = task
+        registry._order.append(task.task_id)
+
+        # Acquire worker — should bind permissions
+        agent = await mgr._acquire_worker(task)
+        assert agent is not None
+
+        # Verify agent has _permissions
+        assert hasattr(agent, '_permissions'), "Agent should have _permissions after _acquire_worker"
+        perms = agent._permissions
+        assert perms.template_name == "coder"
+        assert perms.trust_level == "restricted"
+
+        # Verify permission checks work
+        assert perms.can_read(f"state/agents/{agent.agent_id}/IDENTITY.md") is True
+        assert perms.can_execute("git status") is True
+        assert perms.can_execute("rm -rf /") is False
+        assert perms.can_modify_file("identity") is True
+        assert perms.can_modify_file("profile") is False
+
+        # Cleanup
+        if agent.agent_id in mgr.pool.agents:
+            mgr.pool.agents.pop(agent.agent_id, None)
+
+    finally:
+        _cleanup_dir(tmp)
+
+
+# ============================================================
+# Test 14: AgentLoop sandbox + agent_permissions parameters (Bug 4 fix)
+# ============================================================
+
+def test_agent_loop_sandbox_params():
+    """AgentLoop accepts sandbox and agent_permissions as optional parameters."""
+    from src.loop_engine import AgentLoop, LoopConfig, ToolLoop
+    from src.tools.base import ToolRegistry
+
+    config = LoopConfig()
+    registry = ToolRegistry()
+    tool_loop = ToolLoop(registry, config)
+    llm = MagicMock()
+
+    # Without sandbox (backward compat)
+    loop1 = AgentLoop(tool_loop=tool_loop, llm=llm, config=config)
+    assert hasattr(loop1, 'sandbox'), "AgentLoop should have sandbox attribute"
+    assert loop1.sandbox is None
+    assert hasattr(loop1, 'agent_permissions'), "AgentLoop should have agent_permissions attribute"
+    assert loop1.agent_permissions is None
+
+    # With sandbox
+    mock_sandbox = MagicMock()
+    mock_perms = MagicMock()
+    loop2 = AgentLoop(
+        tool_loop=tool_loop, llm=llm, config=config,
+        sandbox=mock_sandbox,
+        agent_permissions=mock_perms,
+    )
+    assert loop2.sandbox is mock_sandbox
+    assert loop2.agent_permissions is mock_perms
+
+
+# ============================================================
+# Test 15: self_modify in EVOLVE phase (Bug 5 fix)
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_self_modify_in_evolve_phase():
+    """AgentLoop EVOLVE phase calls self_modify when score > 0.85."""
+    from src.loop_engine import AgentLoop, LoopConfig, ToolLoop
+    from src.tools.base import ToolRegistry
+    from src.agent_soul import AgentSoul, SoulBuilder
+
+    tmp = _temp_dir()
+    try:
+        agent_id = f"agent:evolve-test:{uuid.uuid4().hex[:8]}"
+        state_root = Path(tmp) / "state"
+
+        # Build a real AgentSoul
+        soul = SoulBuilder(agent_id=agent_id, state_root=str(state_root)) \
+            .with_personality("executor") \
+            .with_role("coder") \
+            .build()
+
+        # Verify self_modify is available
+        assert hasattr(soul, 'self_modify'), "AgentSoul should have self_modify method"
+
+        # Read original identity
+        original = soul.identity_content
+        assert 'experience' not in original.lower()
+
+        # Simulate high-score EVOLVE: call self_modify with high eval_score
+        # This is a direct call to verify self_modify works (without full loop)
+        new_identity = original + '\n\n## 经验\n积累了成功的执行经验。'
+
+        result = await soul.self_modify('identity', new_identity, permissions=None)
+        assert result is True, f"self_modify should succeed: {result}"
+
+        # Check identity was updated (read file directly since identity_content is a cached property)
+        identity_path = soul._private_dir / "IDENTITY.md"
+        updated = identity_path.read_text()
+        assert 'experience' in updated.lower() or '经验' in updated
+
+    finally:
+        _cleanup_dir(tmp)
+
+
+@pytest.mark.asyncio
+async def test_self_modify_permission_blocked():
+    """self_modify returns False when permissions deny modification."""
+    from src.agent_soul import SoulBuilder
+    from src.permissions import AgentPermissions
+
+    tmp = _temp_dir()
+    try:
+        agent_id = f"agent:perm-block:{uuid.uuid4().hex[:8]}"
+        state_root = Path(tmp) / "state"
+
+        # Create permissions config that blocks identity modification
+        perm_config_dir = Path(tmp) / "config"
+        perm_config_dir.mkdir(parents=True, exist_ok=True)
+        perm_config = perm_config_dir / "permissions.json"
+        perm_config.write_text(json.dumps({
+            "templates": {
+                "restricted_coder": {
+                    "trust_level": "restricted",
+                    "filesystem": {
+                        "read_paths": [],
+                        "write_paths": [],
+                        "blocked_paths": ["*"]
+                    },
+                    "network": {"allowed_hosts": [], "blocked_hosts": ["*"]},
+                    "shell": {"allowed": False, "allowed_commands": [], "blocked_commands": []},
+                    "agent_ops": {},
+                    "self_modification": {
+                        "can_modify_identity": False,
+                        "can_modify_role": False,
+                        "can_append_journal": False,
+                        "can_modify_knowledge": False,
+                        "can_modify_profile": False
+                    }
+                }
+            },
+            "elevation": {"requires_approval": True}
+        }))
+
+        soul = SoulBuilder(agent_id=agent_id, state_root=str(state_root)) \
+            .with_personality("executor") \
+            .with_role("restricted_coder") \
+            .build()
+
+        # Create permissions that deny identity modification
+        perms = AgentPermissions(
+            template_name="restricted_coder",
+            agent_id=agent_id,
+            config_path=str(perm_config),
+        )
+        assert perms.can_modify_file('identity') is False
+
+        # self_modify should return False
+        result = await soul.self_modify('identity', 'new content', permissions=perms)
+        assert result is False, "self_modify should be blocked by permissions"
+
+    finally:
+        _cleanup_dir(tmp)
+
+
+# ============================================================
+# Test 16: AgentManagerAgent SandboxManager integration (Bug 7 fix)
+# ============================================================
+
+def test_agent_manager_accepts_sandbox():
+    """AgentManagerAgent accepts sandbox parameter and stores it."""
+    from src.loop_engine import LoopConfig
+
+    config = LoopConfig()
+    registry = TaskRegistry()
+    mock_loop = MagicMock()
+    mock_loop.tool_loop = MagicMock()
+    mock_loop.llm = MagicMock()
+    mock_sandbox = MagicMock()
+    mock_checker = MagicMock()
+
+    mgr = AgentManagerAgent(
+        memory=MagicMock(),
+        agent_loop=mock_loop,
+        config=config,
+        registry=registry,
+        permission_checker=mock_checker,
+        sandbox=mock_sandbox,
+    )
+
+    assert mgr.permission_checker is mock_checker
+    assert mgr.sandbox is mock_sandbox
+
+    # Also verify backward compat (neither provided)
+    mgr2 = AgentManagerAgent(
+        memory=MagicMock(),
+        agent_loop=mock_loop,
+        config=config,
+        registry=registry,
+    )
+    assert mgr2.permission_checker is None
+    assert mgr2.sandbox is None
