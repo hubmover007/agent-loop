@@ -12,6 +12,25 @@ cd agent-loop
 bash install.sh
 ```
 
+### Setup
+
+```bash
+agent-loop setup
+```
+
+交互式配置 LLM provider、SurrealDB、Embedding。
+
+### Run
+
+```bash
+agent-loop start       # 启动系统
+agent-loop chat "你好"  # 单次对话
+agent-loop serve       # API 服务
+agent-loop doctor      # 健康检查
+agent-loop test        # 跑测试
+agent-loop status      # 查看状态
+```
+
 ### Docker 部署
 
 ```bash
@@ -24,7 +43,7 @@ docker-compose up -d
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
-python3 -m src.cli init-config
+agent-loop setup
 agent-loop start
 ```
 

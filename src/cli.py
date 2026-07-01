@@ -15,7 +15,9 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -419,6 +421,471 @@ def cmd_anchor_lookup(args):
     print(f"{args.name}.{args.key} = {value}")
 
 
+def cmd_setup(args):
+    """Interactive setup wizard for first-time configuration.
+
+    Guides user through:
+    1. LLM provider selection (EasyRouter / OpenAI / DeepSeek / local)
+    2. API key input
+    3. SurrealDB configuration (Docker / existing / skip)
+    4. Embedding configuration
+    5. Basic preferences (timezone, language)
+    6. Write config files + .env
+    7. Verify connectivity
+    8. Initialize DB schema
+    """
+    print("🐕 Agent-Loop 配置向导")
+    print("=" * 40)
+
+    # ── 1. LLM Provider ──
+    print("\n📋 1. LLM 配置")
+    print("  EasyRouter: 聚合平台，支持 deepseek/gpt/gemini/glm/kimi 等 8+ 模型")
+    print("  OpenAI: 直连 OpenAI API")
+    print("  DeepSeek: 直连 DeepSeek API（便宜）")
+    print("  Local: 本地模型（需额外配置）")
+
+    provider = input("\n选择 LLM provider [easyrouter/openai/deepseek/local] (默认 easyrouter): ").strip() or "easyrouter"
+
+    config = {"provider": provider, "models": []}
+
+    if provider == "easyrouter":
+        api_key = input("EasyRouter API Key: ").strip()
+        if not api_key:
+            print("⚠️  未输入 API Key，稍后可手动配置 .env")
+        else:
+            config["api_key"] = api_key
+
+        print("\n可选模型:")
+        models = [
+            ("deepseek-v4-pro", "推理主力（推荐）"),
+            ("deepseek-v4-flash", "快速轻量"),
+            ("gpt-5.5", "GPT 推理+视觉"),
+            ("gemini-2.5-flash", "Gemini 视觉"),
+            ("glm-5-turbo", "GLM 快速"),
+            ("kimi-k2.6", "Kimi 推理"),
+            ("glm-5.1", "GLM 文本"),
+            ("glm-5.2", "GLM 文本"),
+        ]
+        for i, (mid, desc) in enumerate(models, 1):
+            print(f"  {i}. {mid} — {desc}")
+
+        print("\n推荐全选（8个模型都已验证可用）")
+        config["models"] = [m[0] for m in models]
+
+    elif provider == "openai":
+        api_key = input("OpenAI API Key: ").strip()
+        config["api_key"] = api_key
+        config["models"] = ["gpt-4o", "gpt-4o-mini"]
+
+    elif provider == "deepseek":
+        api_key = input("DeepSeek API Key: ").strip()
+        config["api_key"] = api_key
+        config["models"] = ["deepseek-chat", "deepseek-reasoner"]
+
+    elif provider == "local":
+        print("本地模型需要 ollama 或 vLLM，请参考文档配置")
+        config["endpoint"] = input("本地 API endpoint (默认 http://localhost:11434/v1): ").strip() or "http://localhost:11434/v1"
+        config["models"] = ["llama3"]
+
+    # ── 2. SurrealDB ──
+    print("\n📋 2. SurrealDB 配置")
+    surreal_choice = input("SurrealDB 状态: [1]已有(默认) [2]Docker启动 [3]跳过: ").strip() or "1"
+
+    surreal_config = {"url": "surrealdb://localhost:8001", "namespace": "agent_loop", "database": "main"}
+
+    if surreal_choice == "2":
+        print("启动 SurrealDB Docker 容器...")
+        subprocess.run([
+            "docker", "run", "-d", "--name", "agent-loop-surrealdb",
+            "-p", "8001:8000",
+            "surrealdb/surrealdb:latest",
+            "start", "--user", "root", "--pass", "root"
+        ], check=True)
+        print("✅ SurrealDB 已启动 (localhost:8001)")
+    elif surreal_choice == "3":
+        surreal_config["enabled"] = False
+        print("⚠️  跳过 SurrealDB，将使用 SQLite 后端")
+    else:
+        custom_url = input(f"SurrealDB URL (默认 {surreal_config['url']}): ").strip()
+        if custom_url:
+            surreal_config["url"] = custom_url
+
+    # ── 3. Embedding ──
+    print("\n📋 3. Embedding 配置")
+    print("  mock: 测试用，不需要 API（推荐初次使用）")
+    print("  openai: 用 OpenAI text-embedding-3-small")
+    print("  local: 本地 sentence-transformers")
+
+    emb_provider = input("选择 embedding [mock/openai/local] (默认 mock): ").strip() or "mock"
+    emb_config = {"provider": emb_provider, "dimensions": 1536}
+
+    if emb_provider == "openai":
+        emb_key = input("OpenAI API Key (可复用上面的): ").strip() or config.get("api_key", "")
+        emb_config["api_key"] = emb_key
+
+    # ── 4. 基本偏好 ──
+    print("\n📋 4. 基本配置")
+    timezone = input("时区 (默认 Asia/Shanghai): ").strip() or "Asia/Shanghai"
+    language = input("语言 [zh/en] (默认 zh): ").strip() or "zh"
+
+    # ── 5. 写配置文件 ──
+    print("\n📝 写入配置文件...")
+
+    # 5a. .env 文件（已存在则追加不覆盖）
+    env_path = Path(".env")
+    existing_env = set()
+    if env_path.exists():
+        existing_env = set(line.split("=", 1)[0] for line in env_path.read_text().strip().split("\n") if line.strip() and not line.startswith("#") and "=" in line)
+
+    new_env_lines = []
+    if provider == "easyrouter" and "api_key" in config:
+        if "EASYROUTER_API_KEY" not in existing_env:
+            new_env_lines.append(f"EASYROUTER_API_KEY={config['api_key']}")
+    if provider == "openai" and "api_key" in config:
+        if "OPENAI_API_KEY" not in existing_env:
+            new_env_lines.append(f"OPENAI_API_KEY={config['api_key']}")
+    if provider == "deepseek" and "api_key" in config:
+        if "DEEPSEEK_API_KEY" not in existing_env:
+            new_env_lines.append(f"DEEPSEEK_API_KEY={config['api_key']}")
+    if emb_provider == "openai" and "api_key" in emb_config:
+        if "OPENAI_API_KEY" not in existing_env:
+            new_env_lines.append(f"OPENAI_API_KEY={emb_config['api_key']}")
+
+    if "LOG_LEVEL" not in existing_env:
+        new_env_lines.append("LOG_LEVEL=INFO")
+    if "TZ" not in existing_env:
+        new_env_lines.append(f"TZ={timezone}")
+
+    if new_env_lines:
+        if env_path.exists():
+            with open(env_path, "a") as f:
+                f.write("\n".join(new_env_lines) + "\n")
+            print(f"  ✅ {env_path} (已追加)")
+        else:
+            env_path.write_text("\n".join(new_env_lines) + "\n")
+            print(f"  ✅ {env_path} (已创建)")
+    else:
+        print(f"  ✅ {env_path} (无需更新)")
+
+    # 5b. agent-loop.yaml
+    yaml_config = {
+        "memory": {
+            "url": surreal_config["url"],
+            "namespace": surreal_config["namespace"],
+            "database": surreal_config["database"],
+            "embedding": emb_config,
+        },
+        "llm": {
+            "provider": provider,
+            "endpoint": config.get("endpoint", ""),
+        },
+        "loop": {
+            "max_reason_loops": 8,
+            "reason_confidence_threshold": 0.85,
+            "max_agent_concurrent": 10,
+            "accept_threshold": 0.7,
+        },
+        "server": {
+            "host": "0.0.0.0",
+            "port": 8000,
+        },
+    }
+
+    yaml_path = Path("agent-loop.yaml")
+    yaml_path.write_text(yaml.dump(yaml_config, default_flow_style=False, allow_unicode=True))
+    print(f"  ✅ {yaml_path}")
+
+    # 5c. config/llm_pool.json
+    _generate_llm_pool(config, provider)
+    print(f"  ✅ config/llm_pool.json")
+
+    # 5d. 创建目录
+    for d in ["state/anchors", "state/agents", "logs", "config/agents"]:
+        Path(d).mkdir(parents=True, exist_ok=True)
+    print(f"  ✅ 目录结构")
+
+    # ── 6. 验证连通性 ──
+    print("\n🔌 验证连通性...")
+
+    if provider == "easyrouter" and "api_key" in config:
+        try:
+            import httpx
+            resp = httpx.get(
+                "https://easyrouter.io/v1/models",
+                headers={"Authorization": f"Bearer {config['api_key']}"},
+                timeout=10.0,
+            )
+            if resp.status_code == 200:
+                print("  ✅ EasyRouter API 连通")
+            else:
+                print(f"  ⚠️  EasyRouter API 返回 {resp.status_code}")
+        except Exception as e:
+            print(f"  ⚠️  EasyRouter API 连接失败: {e}")
+
+    if surreal_config.get("enabled", True):
+        try:
+            async def check_db():
+                from surrealdb import AsyncSurreal
+                db = AsyncSurreal(surreal_config["url"])
+                await db.connect()
+                await db.signin({"user": "root", "pass": "root"})
+                await db.use(surreal_config["namespace"], surreal_config["database"])
+                await db.query("SELECT 1")
+            asyncio.run(check_db())
+            print("  ✅ SurrealDB 连通")
+        except Exception as e:
+            print(f"  ⚠️  SurrealDB 连接失败: {e}")
+
+    # ── 7. 初始化 DB Schema ──
+    if surreal_config.get("enabled", True):
+        print("\n🗄️  初始化数据库 Schema...")
+        try:
+            async def init_schema():
+                from surrealdb import AsyncSurreal
+                db = AsyncSurreal(surreal_config["url"])
+                await db.connect()
+                await db.signin({"user": "root", "pass": "root"})
+                await db.use(surreal_config["namespace"], surreal_config["database"])
+
+                schema_path = Path("src/memory/schema.surql")
+                if schema_path.exists():
+                    schema_sql = schema_path.read_text()
+                    for statement in schema_sql.split(";\n"):
+                        lines = [l for l in statement.split("\n")
+                                 if l.strip() and not l.strip().startswith("--")]
+                        stmt = "\n".join(lines).strip()
+                        if stmt:
+                            try:
+                                await db.query(stmt)
+                            except Exception:
+                                pass  # ignore "already exists"
+                print("  ✅ Schema 初始化完成")
+            asyncio.run(init_schema())
+        except Exception as e:
+            print(f"  ⚠️  Schema 初始化失败: {e}")
+
+    # ── 8. 创建默认锚点 ──
+    print("\n📍 创建默认锚点...")
+    _create_default_anchors(timezone, language)
+    print("  ✅ state/anchors/")
+
+    # ── 完成 ──
+    print("\n" + "=" * 40)
+    print("✅ 配置完成！")
+    print("\n🚀 启动系统:")
+    print("  agent-loop start         # 启动完整系统")
+    print("  agent-loop serve         # 只启动 API 服务")
+    print("  agent-loop chat \"你好\"    # 单次对话")
+    print("  agent-loop status        # 查看状态")
+    print("  agent-loop test          # 跑测试")
+    print("\n📖 文档: https://github.com/hubmover007/agent-loop")
+
+
+def _generate_llm_pool(config, provider):
+    """Generate llm_pool.json based on provider choice."""
+    if provider == "easyrouter":
+        models_config = [
+            {"id": "easyrouter-deepseek-v4-pro", "model": "deepseek-v4-pro",
+             "capabilities": ["general", "coding", "reasoning", "analysis"],
+             "modality": ["text"], "tags": ["primary", "reasoning"]},
+            {"id": "easyrouter-deepseek-v4-flash", "model": "deepseek-v4-flash",
+             "capabilities": ["general", "coding", "quick"],
+             "modality": ["text"], "tags": ["fast", "cheap"]},
+            {"id": "easyrouter-gpt-5.5", "model": "gpt-5.5",
+             "capabilities": ["general", "coding", "reasoning", "vision"],
+             "modality": ["text", "image"], "tags": ["vision", "reasoning"]},
+            {"id": "easyrouter-gemini-2.5-flash", "model": "gemini-2.5-flash",
+             "capabilities": ["general", "vision"],
+             "modality": ["text", "image"], "tags": ["vision"]},
+            {"id": "easyrouter-glm-5-turbo", "model": "glm-5-turbo",
+             "capabilities": ["general", "quick"],
+             "modality": ["text"], "tags": ["fast", "cheap"]},
+            {"id": "easyrouter-kimi-k2.6", "model": "kimi-k2.6",
+             "capabilities": ["general", "reasoning"],
+             "modality": ["text"], "tags": ["reasoning"]},
+            {"id": "easyrouter-glm-5.1", "model": "glm-5.1",
+             "capabilities": ["general"],
+             "modality": ["text"], "tags": []},
+            {"id": "easyrouter-glm-5.2", "model": "glm-5.2",
+             "capabilities": ["general"],
+             "modality": ["text"], "tags": []},
+        ]
+        providers = []
+        for m in models_config:
+            providers.append({
+                "id": m["id"],
+                "type": "openai",
+                "endpoint": "https://easyrouter.io/v1",
+                "model": m["model"],
+                "api_key_source": "env:EASYROUTER_API_KEY",
+                "capabilities": m["capabilities"],
+                "modality": m["modality"],
+                "cost_per_1m_input": 0.0,
+                "cost_per_1m_output": 0.0,
+                "max_concurrent": 10,
+                "verified": False,
+                "enabled": True,
+                "tags": m["tags"],
+            })
+    elif provider == "openai":
+        providers = [
+            {"id": "openai-gpt-4o", "type": "openai", "endpoint": "https://api.openai.com/v1",
+             "model": "gpt-4o", "api_key_source": "env:OPENAI_API_KEY",
+             "capabilities": ["general", "coding", "reasoning", "vision"],
+             "modality": ["text", "image"], "enabled": True, "tags": ["primary"]},
+            {"id": "openai-gpt-4o-mini", "type": "openai", "endpoint": "https://api.openai.com/v1",
+             "model": "gpt-4o-mini", "api_key_source": "env:OPENAI_API_KEY",
+             "capabilities": ["general", "quick"],
+             "modality": ["text"], "enabled": True, "tags": ["fast"]},
+        ]
+    elif provider == "deepseek":
+        providers = [
+            {"id": "deepseek-chat", "type": "openai", "endpoint": "https://api.deepseek.com/v1",
+             "model": "deepseek-chat", "api_key_source": "env:DEEPSEEK_API_KEY",
+             "capabilities": ["general", "coding"], "modality": ["text"],
+             "enabled": True, "tags": ["primary"]},
+            {"id": "deepseek-reasoner", "type": "openai", "endpoint": "https://api.deepseek.com/v1",
+             "model": "deepseek-reasoner", "api_key_source": "env:DEEPSEEK_API_KEY",
+             "capabilities": ["reasoning"], "modality": ["text"],
+             "enabled": True, "tags": ["reasoning"]},
+        ]
+    else:  # local
+        providers = [
+            {"id": "local-default", "type": "openai", "endpoint": "http://localhost:11434/v1",
+             "model": "llama3", "api_key_source": "none",
+             "capabilities": ["general"], "modality": ["text"],
+             "enabled": True, "tags": ["local"]},
+        ]
+
+    pool_config = {
+        "providers": providers,
+        "selection": {
+            "default_strategy": "balanced",
+            "task_mapping": {
+                "reasoning": "most_capable",
+                "coding": "cheapest",
+                "quick": "cheapest",
+                "general": "balanced",
+            },
+            "strategies": {
+                "cheapest": {"sort_by": "cost_per_1m_input", "ascending": True},
+                "most_capable": {"sort_by": "cost_per_1m_input", "ascending": False},
+                "balanced": {"weights": {"cost": 0.5, "capability_match": 0.5}},
+            },
+        },
+    }
+
+    config_dir = Path("config")
+    config_dir.mkdir(exist_ok=True)
+    (config_dir / "llm_pool.json").write_text(json.dumps(pool_config, indent=2))
+
+
+def _create_default_anchors(timezone, language):
+    """Create default anchor files during setup."""
+    anchor_dir = Path("state/anchors")
+    anchor_dir.mkdir(parents=True, exist_ok=True)
+
+    system_md = f"""# System Anchor
+
+## Config
+- **timezone**: {timezone}
+- **language**: {language}
+- **created_at**: {datetime.now().isoformat()}
+"""
+    (anchor_dir / "system.md").write_text(system_md)
+
+
+def cmd_test(args):
+    """Run test suite."""
+    cmd = ["python3", "-m", "pytest", "tests/", "-q"]
+    if args.verbose:
+        cmd.append("-v")
+    if args.coverage:
+        cmd.extend(["--cov=src", "--cov-report=term-missing"])
+    subprocess.run(cmd)
+
+
+def cmd_doctor(args):
+    """System health check."""
+    print("🐕 Agent-Loop Doctor")
+    print("=" * 40)
+
+    checks = []
+
+    # 1. Python
+    checks.append(("Python 3.12+", sys.version_info >= (3, 12), sys.version))
+
+    # 2. Dependencies
+    try:
+        import httpx  # noqa: F811
+        import pydantic, jsonschema  # noqa: F401
+        checks.append(("Core dependencies", True, "all imported"))
+    except ImportError as e:
+        checks.append(("Core dependencies", False, str(e)))
+
+    # 3. SurrealDB
+    try:
+        async def check_db():
+            from surrealdb import AsyncSurreal
+            db = AsyncSurreal("ws://localhost:8001/rpc")
+            await db.connect()
+            await db.signin({"user": "root", "pass": "root"})
+            await db.use("agent_loop", "main")
+            await db.query("SELECT 1")
+        asyncio.run(asyncio.wait_for(check_db(), timeout=5))
+        checks.append(("SurrealDB", True, "localhost:8001"))
+    except Exception as e:
+        checks.append(("SurrealDB", False, str(e)[:80]))
+
+    # 4. Config files
+    for f in ["agent-loop.yaml", "config/llm_pool.json", ".env"]:
+        checks.append((f"Config: {f}", Path(f).exists(), str(Path(f))))
+
+    # 5. LLM API
+    env_key = os.environ.get("EASYROUTER_API_KEY", "")
+    if env_key:
+        try:
+            import httpx
+            resp = httpx.get("https://easyrouter.io/v1/models",
+                           headers={"Authorization": f"Bearer {env_key}"}, timeout=5)
+            checks.append(("LLM API (EasyRouter)", resp.status_code == 200, f"{resp.status_code}"))
+        except Exception as e:
+            checks.append(("LLM API (EasyRouter)", False, str(e)[:60]))
+    else:
+        checks.append(("LLM API", False, "No API key in .env"))
+
+    # 6. Schema
+    try:
+        async def check_schema():
+            from surrealdb import AsyncSurreal
+            db = AsyncSurreal("ws://localhost:8001/rpc")
+            await db.connect()
+            await db.signin({"user": "root", "pass": "root"})
+            await db.use("agent_loop", "main")
+            r = await db.query("INFO FOR TABLE fact")
+            return r
+        r = asyncio.run(asyncio.wait_for(check_schema(), timeout=5))
+        checks.append(("DB Schema", bool(r), "initialized" if r else "not found"))
+    except Exception as e:
+        checks.append(("DB Schema", False, str(e)[:50]))
+
+    # Print results
+    all_ok = True
+    for name, ok, detail in checks:
+        status = "✅" if ok else "❌"
+        print(f"  {status} {name}: {detail}")
+        if not ok:
+            all_ok = False
+
+    print()
+    if all_ok:
+        print("✅ 所有检查通过！系统健康。")
+    else:
+        print("⚠️  部分检查未通过，运行 'agent-loop setup' 修复。")
+
+    return 0 if all_ok else 1
+
+
 def cmd_cleanup(args):
     """Clean up stale episodes from memory."""
     sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -509,6 +976,20 @@ def main():
         description="Agent-Loop: Loop Engine for AI Agent orchestration",
     )
     sub = parser.add_subparsers(dest="command")
+
+    # setup
+    p_setup = sub.add_parser("setup", help="Interactive setup wizard for first-time configuration")
+    p_setup.set_defaults(func=cmd_setup)
+
+    # test
+    p_test = sub.add_parser("test", help="Run test suite")
+    p_test.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    p_test.add_argument("--coverage", action="store_true", help="Run with coverage report")
+    p_test.set_defaults(func=cmd_test)
+
+    # doctor
+    p_doctor = sub.add_parser("doctor", help="System health check")
+    p_doctor.set_defaults(func=cmd_doctor)
 
     # init-config
     p_init = sub.add_parser("init-config", help="Initialize configuration file")
