@@ -108,7 +108,7 @@ class DeepSeekProvider(LLMProvider):
         logger.warning("DeepSeek embedding not natively supported, using placeholder")
         # Return zero vectors as placeholder - configure real embedder in production
         texts = [text] if isinstance(text, str) else text
-        return [[0.0] * 1024 for _ in texts]
+        return [[0.0] * 1536 for _ in texts]
 
 
 # ============================================================
@@ -388,7 +388,7 @@ class OpenAICompatibleProvider(LLMProvider):
             return [item["embedding"] for item in data["data"]]
         except Exception as e:
             logger.warning("Embedding failed: %s, using zero vectors", e)
-            return [[0.0] * 1024 for _ in texts]
+            return [[0.0] * 1536 for _ in texts]
 
 
 # ============================================================

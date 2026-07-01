@@ -16,13 +16,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, TYPE_CHECKING
 
 from ..core import MemoryLayer
+from .embedding import EmbeddingService, EmbeddingConfig
 
 _Surreal: Any = None  # lazily resolved in connect()
 
 logger = logging.getLogger(__name__)
 
 # Default embedding dimension (configurable)
-DEFAULT_EMBEDDING_DIM = 1024
+DEFAULT_EMBEDDING_DIM = 1536
 
 
 class MemoryPool:
@@ -46,13 +47,17 @@ class MemoryPool:
 
     def __init__(self, url: str = "ws://127.0.0.1:8000", namespace: str = "agent_loop",
                  database: str = "memory", user: str = "root", password: str = "root",
-                 db_path: str | None = None):
+                 db_path: str | None = None,
+                 embedding_config: EmbeddingConfig | None = None):
         self.url = url
         self.namespace = namespace
         self.database = database
         self._auth = {"user": user, "pass": password}
         self._db: Any = None  # surrealdb.Surreal instance
         self._embedding_fn: Any = None  # Set via configure_embedding()
+        self._embedding_service: EmbeddingService | None = None
+        if embedding_config:
+            self._embedding_service = EmbeddingService(embedding_config)
         self._mem: dict[str, list[dict]] = {}  # in-memory fallback
         self._db_path: str | None = db_path
         self._sqlite: Any = None  # sqlite3.Connection when db_path is set
@@ -164,21 +169,52 @@ class MemoryPool:
     def configure_embedding(self, fn: Any) -> None:
         """Set the embedding function used for vectorization.
 
+        Legacy API: kept for compatibility. Prefer passing an
+        ``EmbeddingConfig`` to the constructor for structured configuration.
+
         Args:
             fn: Callable that takes text and returns list[float].
                 e.g. lambda text: openai.Embedding.create(input=text, model="text-embedding-3-small")
         """
         self._embedding_fn = fn
 
+    @property
+    def embedding_service(self) -> EmbeddingService | None:
+        """Return the configured EmbeddingService, if any."""
+        if self._embedding_service is not None:
+            return self._embedding_service
+        # Legacy: no service wrapper for raw embedding_fn
+        return None
+
     async def embed(self, text: str) -> list[float]:
-        """Vectorize text using configured embedding function."""
-        if self._embedding_fn is None:
-            raise RuntimeError("Embedding function not configured. Call configure_embedding() first.")
-        result = self._embedding_fn(text)
-        if hasattr(result, "data") and hasattr(result.data, "__getitem__"):
-            # OpenAI-style response
-            return result.data[0].embedding
-        return list(result)
+        """Vectorize text using configured embedding.
+
+        Prefers EmbeddingService; falls back to legacy embedding_fn;
+        returns a zero-vector if nothing is configured.
+        """
+        if self._embedding_service is not None:
+            return await self._embedding_service.embed(text)
+        if self._embedding_fn is not None:
+            result = self._embedding_fn(text)
+            if hasattr(result, "data") and hasattr(result.data, "__getitem__"):
+                # OpenAI-style response
+                return result.data[0].embedding
+            return list(result)
+        # Return zero-vector instead of raising — allows code that
+        # calls write_fact/write_episode without embedding configured.
+        return [0.0] * DEFAULT_EMBEDDING_DIM
+
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Batch-embed multiple texts."""
+        if self._embedding_service is not None:
+            return await self._embedding_service.embed_batch(texts)
+        if self._embedding_fn is not None:
+            fn = self._embedding_fn
+            return [
+                list(fn(t).data[0].embedding if hasattr(fn(t), "data") and hasattr(fn(t).data, "__getitem__") else fn(t))
+                for t in texts
+            ]
+        return [[0.0] * DEFAULT_EMBEDDING_DIM for _ in texts]
 
     # ============================================================
     # Memory Compression
@@ -352,7 +388,7 @@ class MemoryPool:
             agent_id: Namespace isolation key (defaults to "shared" for
                       backward compatibility).
         """
-        embedding = await self.embed(embedding_text or name) if self._embedding_fn else None
+        embedding = await self.embed(embedding_text or name) if (self._embedding_service or self._embedding_fn) else None
         record = {
             "fact_type": fact_type,
             "name": name,
@@ -391,7 +427,7 @@ class MemoryPool:
 
     async def write_facet(self, name: str, description: str) -> str:
         """Write a Facet to Layer 1 (upsert: update if name already exists)."""
-        embedding = await self.embed(description) if self._embedding_fn else None
+        embedding = await self.embed(description) if (self._embedding_service or self._embedding_fn) else None
         record = {
             "name": name,
             "description": description,
@@ -422,7 +458,7 @@ class MemoryPool:
                             task_count: int = 0, session_id: str = "",
                             consolidated: bool = False) -> str:
         """Write an Episode to Layer 2."""
-        embedding = await self.embed(summary) if self._embedding_fn else None
+        embedding = await self.embed(summary) if (self._embedding_service or self._embedding_fn) else None
         record = {
             "title": title,
             "summary": summary,
@@ -449,7 +485,7 @@ class MemoryPool:
 
     async def write_project(self, name: str, description: str) -> str:
         """Write a Project to Layer 3 (upsert: update if name already exists)."""
-        embedding = await self.embed(description) if self._embedding_fn else None
+        embedding = await self.embed(description) if (self._embedding_service or self._embedding_fn) else None
         record = {
             "name": name,
             "description": description,
@@ -476,7 +512,7 @@ class MemoryPool:
 
     async def write_edge(self, source: str, target: str, relation: str) -> str:
         """Write a semantic edge between two nodes."""
-        embedding = await self.embed(relation) if self._embedding_fn else None
+        embedding = await self.embed(relation) if (self._embedding_service or self._embedding_fn) else None
         # Parse source/target table names from RecordID strings like "fact:xxx"
         src_type = source.split(":")[0] if ":" in source else "unknown"
         tgt_type = target.split(":")[0] if ":" in target else "unknown"

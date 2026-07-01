@@ -23,7 +23,7 @@ DEFINE FIELD updated_at ON fact TYPE datetime DEFAULT time::now();
 DEFINE INDEX idx_fact_name ON fact FIELDS fact_type, name, agent_id UNIQUE;
 DEFINE INDEX idx_fact_type ON fact FIELDS fact_type;
 DEFINE INDEX idx_fact_agent ON fact FIELDS agent_id;
-DEFINE INDEX idx_fact_mtree ON fact FIELDS embedding MTREE DIMENSION 1024 DISTANCE COSINE TYPE F64;
+DEFINE INDEX idx_fact_mtree ON fact FIELDS embedding MTREE DIMENSION 1536 DISTANCE COSINE TYPE F64;
 
 -- ============================================================
 -- Layer 1: FACETS (语义维度)
@@ -38,7 +38,7 @@ DEFINE FIELD created_at ON facet TYPE datetime DEFAULT time::now();
 DEFINE FIELD updated_at ON facet TYPE datetime DEFAULT time::now();
 
 DEFINE INDEX idx_facet_name ON facet FIELDS name UNIQUE;
-DEFINE INDEX idx_facet_mtree ON facet FIELDS embedding MTREE DIMENSION 1024 DISTANCE COSINE TYPE F64;
+DEFINE INDEX idx_facet_mtree ON facet FIELDS embedding MTREE DIMENSION 1536 DISTANCE COSINE TYPE F64;
 
 -- ============================================================
 -- Layer 2: EPISODES (事件上下文 - 核心检索返回目标)
@@ -60,7 +60,7 @@ DEFINE FIELD created_at ON episode TYPE datetime DEFAULT time::now();
 DEFINE FIELD updated_at ON episode TYPE datetime DEFAULT time::now();
 
 DEFINE INDEX idx_episode_title ON episode FIELDS title;
-DEFINE INDEX idx_episode_mtree ON episode FIELDS embedding MTREE DIMENSION 1024 DISTANCE COSINE TYPE F64;
+DEFINE INDEX idx_episode_mtree ON episode FIELDS embedding MTREE DIMENSION 1536 DISTANCE COSINE TYPE F64;
 DEFINE INDEX idx_episode_ft ON episode FIELDS summary SEARCH ANALYZER simple BM25;
 
 -- ============================================================
@@ -75,7 +75,7 @@ DEFINE FIELD created_at ON project TYPE datetime DEFAULT time::now();
 DEFINE FIELD updated_at ON project TYPE datetime DEFAULT time::now();
 
 DEFINE INDEX idx_project_name ON project FIELDS name UNIQUE;
-DEFINE INDEX idx_project_mtree ON project FIELDS embedding MTREE DIMENSION 1024 DISTANCE COSINE TYPE F64;
+DEFINE INDEX idx_project_mtree ON project FIELDS embedding MTREE DIMENSION 1536 DISTANCE COSINE TYPE F64;
 
 -- ============================================================
 -- 语义边: 节点间关系，每条边有自然语言描述 + 向量化
@@ -92,7 +92,7 @@ DEFINE FIELD created_at ON edge TYPE datetime DEFAULT time::now();
 
 DEFINE INDEX idx_edge_source ON edge FIELDS source_id;
 DEFINE INDEX idx_edge_target ON edge FIELDS target_id;
-DEFINE INDEX idx_edge_mtree ON edge FIELDS embedding MTREE DIMENSION 1024 DISTANCE COSINE TYPE F64;
+DEFINE INDEX idx_edge_mtree ON edge FIELDS embedding MTREE DIMENSION 1536 DISTANCE COSINE TYPE F64;
 
 -- ============================================================
 -- 图关系定义 (SurrealDB RELATE)

@@ -180,7 +180,7 @@ class UnifiedRetriever:
             return embeddings[0] if isinstance(embeddings, list) and embeddings else embeddings
         except Exception:
             # Fallback: return zero vector
-            return [0.0] * 1024
+            return [0.0] * 1536
 
     @staticmethod
     def _format_graph_context(graph_results: list[dict]) -> str:
