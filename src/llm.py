@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any
 
 from .loop_engine import LLMProvider, LLMResponse
@@ -401,10 +402,17 @@ def create_provider(provider_type: str, **kwargs) -> LLMProvider:
         "deepseek": DeepSeekProvider,
         "anthropic-bedrock": AnthropicBedrockProvider,
         "openai-compatible": OpenAICompatibleProvider,
+        "easyrouter": OpenAICompatibleProvider,  # EasyRouter via OpenAI-compatible interface
     }
 
     cls = providers.get(provider_type)
     if cls is None:
         raise ValueError(f"Unknown provider type: {provider_type}. Available: {list(providers.keys())}")
+
+    # EasyRouter: set default endpoint and API key
+    if provider_type == "easyrouter":
+        kwargs.setdefault("base_url", "https://easyrouter.io/v1")
+        kwargs.setdefault("api_key", os.environ.get("EASYROUTER_API_KEY", ""))
+        kwargs.setdefault("default_model", "deepseek-v4-pro")
 
     return cls(**kwargs)

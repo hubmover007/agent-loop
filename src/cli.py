@@ -37,6 +37,78 @@ def setup_logging():
         logging.basicConfig(level=logging.INFO)
 
 
+def _load_env() -> None:
+    """Load .env file into os.environ. Idempotent (setdefault)."""
+    env_path = Path(".env")
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def _resolve_api_key(api_key_source: str) -> str:
+    """Resolve API key from source string like 'env:EASYROUTER_API_KEY'.
+
+    Supported formats:
+        - "env:VAR_NAME" → read from os.environ
+        - "none" → return "not-needed"
+        - otherwise → return as-is (literal key)
+    """
+    if not api_key_source:
+        return ""
+    if api_key_source.startswith("env:"):
+        env_var = api_key_source[4:]
+        return os.environ.get(env_var, "")
+    if api_key_source == "none":
+        return "not-needed"
+    return api_key_source  # literal key
+
+
+def _create_llm_from_config(args: argparse.Namespace) -> "LLMProvider":
+    """Create LLM provider from config, preferring LLMPool if available.
+
+    Priority:
+    1. config/llm_pool.json exists → load first enabled provider via OpenAICompatibleProvider
+    2. args.provider is set → create_provider()
+    3. Default → easyrouter with EASYROUTER_API_KEY env var
+    """
+    from src.llm_pool import LLMPool
+    from src.llm import create_provider, OpenAICompatibleProvider
+
+    # Try LLMPool first
+    pool_path = Path("config/llm_pool.json")
+    if pool_path.exists():
+        try:
+            pool = LLMPool(str(pool_path))
+            pool.initialize()
+            if pool._pool_config:
+                for cfg in pool._pool_config.providers:
+                    if cfg.enabled:
+                        api_key = _resolve_api_key(cfg.api_key_source)
+                        if api_key:
+                            logger.info("Using LLM from LLMPool: %s (%s)", cfg.id, cfg.model)
+                            return OpenAICompatibleProvider(
+                                base_url=cfg.endpoint,
+                                api_key=api_key,
+                                default_model=cfg.model,
+                            )
+        except Exception as e:
+            logger.warning("LLMPool load failed: %s, falling back", e)
+
+    # Fallback: create_provider
+    provider_type = args.provider or "easyrouter"
+    if provider_type == "easyrouter":
+        api_key = args.api_key or os.environ.get("EASYROUTER_API_KEY", "")
+        logger.info("Using EasyRouter provider (fallback)")
+        return create_provider("easyrouter", api_key=api_key)
+    else:
+        api_key = args.api_key or os.environ.get("LLM_API_KEY", "")
+        logger.info("Using provider: %s", provider_type)
+        return create_provider(provider_type, api_key=api_key)
+
+
 def cmd_init_config(args):
     """Initialize configuration files and directory structure."""
     config_dir = Path("config")
@@ -135,16 +207,21 @@ def cmd_chat(args):
 
     async def run():
         from src.memory import MemoryPool
-        from src.llm import create_provider
         from src.loop_engine import LoopConfig
         from src.loop_engine.main_loop import MainLoop
 
-        # Initialize
+        # ── Load environment variables ──
+        _load_env()
+
+        # ── Initialize MemoryPool ──
         memory = MemoryPool(args.memory_url)
-        llm = create_provider(
-            args.provider,
-            api_key=args.api_key or os.environ.get("LLM_API_KEY", ""),
-        )
+        if args.memory_url.startswith("ws://") or args.memory_url.startswith("surrealdb://"):
+            await memory.connect()
+            await memory.initialize_schema()
+
+        # ── Initialize LLM (LLMPool preferred, fallback create_provider) ──
+        llm = _create_llm_from_config(args)
+
         config = LoopConfig()
         loop = MainLoop(memory=memory, llm=llm, config=config)
 
@@ -159,6 +236,10 @@ def cmd_chat(args):
         if ctx.errors:
             print(f"Errors: {ctx.errors}")
 
+        # Cleanup
+        if hasattr(memory, 'disconnect'):
+            await memory.disconnect()
+
     asyncio.run(run())
 
 
@@ -166,17 +247,18 @@ def cmd_serve(args):
     """Start the API server."""
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
+    # ── Load environment variables ──
+    _load_env()
+
     import uvicorn
     from src.memory import MemoryPool
-    from src.llm import create_provider
     from src.loop_engine import LoopConfig
     from src.web import create_app
 
     memory = MemoryPool(args.memory_url)
-    llm = create_provider(
-        args.provider,
-        api_key=args.api_key or os.environ.get("LLM_API_KEY", ""),
-    )
+    # MemoryPool will be connected on first use via the app lifecycle
+
+    llm = _create_llm_from_config(args)
     config = LoopConfig()
     app = create_app(memory=memory, llm=llm, config=config)
 
@@ -229,6 +311,10 @@ def cmd_start(args):
 
     async def run():
         setup_logging()
+
+        # ── Load environment variables ──
+        _load_env()
+
         from src.memory import MemoryPool
         from src.llm import create_provider
         from src.loop_engine import LoopConfig, AgentLoop
@@ -244,7 +330,7 @@ def cmd_start(args):
         from src.permissions import PermissionChecker
 
         config_path = Path(args.config or "agent-loop.yaml")
-        memory_url = args.memory_url or "surrealdb://localhost:8000"
+        memory_url = args.memory_url or "ws://localhost:8001/rpc"
 
         print("=== Agent-Loop Startup ===")
         print()
@@ -255,11 +341,15 @@ def cmd_start(args):
 
         # 2. Create LLMPool + CostController
         llm_pool = LLMPool()
-        try:
-            llm_pool.initialize()
-            print(f"[2/6] LLMPool initialized: {len(llm_pool.list_providers())} providers")
-        except Exception as e:
-            print(f"[2/6] LLMPool warning: {e}")
+        pool_path = Path("config/llm_pool.json")
+        if pool_path.exists():
+            try:
+                llm_pool.initialize()
+                print(f"[2/6] LLMPool initialized: {len(llm_pool.list_providers())} providers")
+            except Exception as e:
+                print(f"[2/6] LLMPool warning: {e}")
+        else:
+            print(f"[2/6] LLMPool: no config/llm_pool.json found")
 
         cost_ctrl = CostController()
         print("[2/6] CostController initialized")
@@ -275,12 +365,17 @@ def cmd_start(args):
         print("[4/6] InteractionHub + MailRouter + PersistenceManager initialized")
 
         # 5. Create LLM and memory
-        llm = create_provider(
-            args.provider or "deepseek",
-            api_key=args.api_key or os.environ.get("LLM_API_KEY", ""),
-        )
+        llm = _create_llm_from_config(args)
         memory = MemoryPool(memory_url)
-        print("[5/6] LLM + MemoryPool initialized")
+        if memory_url.startswith("ws://") or memory_url.startswith("surrealdb://"):
+            try:
+                await memory.connect()
+                await memory.initialize_schema()
+                print("[5/6] LLM + MemoryPool initialized (connected)")
+            except Exception as e:
+                print(f"[5/6] LLM initialized, MemoryPool connect failed: {e}")
+        else:
+            print("[5/6] LLM + MemoryPool initialized")
 
         # 6. Create system agents
         registry = TaskRegistry()
@@ -313,7 +408,7 @@ def cmd_start(args):
         # 7. Show system info
         print()
         print("=== System Ready ===")
-        print(f"  Providers: {len(llm_pool.list_providers())}")
+        print(f"  Providers: {len(llm_pool.list_providers()) if pool_path.exists() else 0}")
         print(f"  Active agents: {len(manager.list_agents())}")
         print(f"  Risk threshold: {hub.risk_threshold}")
         print()
@@ -999,18 +1094,24 @@ def main():
     # chat
     p_chat = sub.add_parser("chat", help="Run a single chat through Loop Engine")
     p_chat.add_argument("message", help="User input message")
-    p_chat.add_argument("--memory-url", default="surrealdb://localhost:8000")
-    p_chat.add_argument("--provider", default="deepseek")
-    p_chat.add_argument("--api-key", default=None)
+    p_chat.add_argument("--memory-url", default="ws://localhost:8001/rpc",
+                        help="SurrealDB WebSocket URL")
+    p_chat.add_argument("--provider", default=None,
+                        help="LLM provider (default: auto from llm_pool.json)")
+    p_chat.add_argument("--api-key", default=None,
+                        help="API key (default: from environment)")
     p_chat.set_defaults(func=cmd_chat)
 
     # serve
     p_serve = sub.add_parser("serve", help="Start API server")
     p_serve.add_argument("--host", default="0.0.0.0")
     p_serve.add_argument("--port", type=int, default=8000)
-    p_serve.add_argument("--memory-url", default="surrealdb://localhost:8000")
-    p_serve.add_argument("--provider", default="deepseek")
-    p_serve.add_argument("--api-key", default=None)
+    p_serve.add_argument("--memory-url", default="ws://localhost:8001/rpc",
+                         help="SurrealDB WebSocket URL")
+    p_serve.add_argument("--provider", default=None,
+                         help="LLM provider (default: auto from llm_pool.json)")
+    p_serve.add_argument("--api-key", default=None,
+                         help="API key (default: from environment)")
     p_serve.set_defaults(func=cmd_serve)
 
     # status
@@ -1020,14 +1121,17 @@ def main():
     # start
     p_start = sub.add_parser("start", help="Start full Agent-Loop system")
     p_start.add_argument("--config", default="agent-loop.yaml")
-    p_start.add_argument("--memory-url", default="surrealdb://localhost:8000")
-    p_start.add_argument("--provider", default="deepseek")
+    p_start.add_argument("--memory-url", default="ws://localhost:8001/rpc",
+                        help="SurrealDB WebSocket URL")
+    p_start.add_argument("--provider", default=None,
+                        help="LLM provider (default: auto from llm_pool.json)")
     p_start.add_argument("--api-key", default=None)
     p_start.set_defaults(func=cmd_start)
 
     # stats
     p_stats = sub.add_parser("stats", help="Show memory pool stats")
-    p_stats.add_argument("--memory-url", default="surrealdb://localhost:8000")
+    p_stats.add_argument("--memory-url", default="ws://localhost:8001/rpc",
+                        help="SurrealDB WebSocket URL")
     p_stats.set_defaults(func=cmd_stats)
 
     # anchor
@@ -1046,7 +1150,8 @@ def main():
     p_anchor_sync = p_anchor_sub.add_parser("sync", help="Sync anchors to SurrealDB")
     p_anchor_sync.add_argument("--name", default=None, help="Specific anchor to sync (default: all)")
     p_anchor_sync.add_argument("--anchor-dir", default="state/anchors")
-    p_anchor_sync.add_argument("--memory-url", default="surrealdb://localhost:8000")
+    p_anchor_sync.add_argument("--memory-url", default="ws://localhost:8001/rpc",
+                              help="SurrealDB WebSocket URL")
     p_anchor_sync.set_defaults(func=cmd_anchor_sync)
 
     p_anchor_lookup = p_anchor_sub.add_parser("lookup", help="Look up a key in an anchor")
@@ -1059,7 +1164,8 @@ def main():
     p_cleanup = sub.add_parser("cleanup", help="Clean up stale episodes from memory")
     p_cleanup.add_argument("--days", type=int, default=30,
                            help="Delete episodes older than N days (default: 30)")
-    p_cleanup.add_argument("--memory-url", default="surrealdb://localhost:8000")
+    p_cleanup.add_argument("--memory-url", default="ws://localhost:8001/rpc",
+                           help="SurrealDB WebSocket URL")
     p_cleanup.set_defaults(func=cmd_cleanup)
 
     # consolidate
@@ -1078,7 +1184,8 @@ def main():
                         help="Disable contradiction resolution phase")
     p_cons.add_argument("--no-pruning", action="store_true",
                         help="Disable memory pruning phase")
-    p_cons.add_argument("--memory-url", default="surrealdb://localhost:8000")
+    p_cons.add_argument("--memory-url", default="ws://localhost:8001/rpc",
+                        help="SurrealDB WebSocket URL")
     p_cons.add_argument("--provider", default=None,
                         help="LLM provider for extraction (default: none, uses heuristic)")
     p_cons.add_argument("--api-key", default=None)
