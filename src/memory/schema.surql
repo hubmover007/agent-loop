@@ -30,7 +30,7 @@ DEFINE FIELD IF NOT EXISTS lesson ON fact TYPE string DEFAULT "";
 DEFINE FIELD IF NOT EXISTS confidence ON fact TYPE float DEFAULT 0.5;
 DEFINE FIELD IF NOT EXISTS related_ids ON fact TYPE array DEFAULT [];
 DEFINE FIELD IF NOT EXISTS related_type ON fact TYPE string DEFAULT "";
-DEFINE FIELD IF NOT EXISTS context ON fact FLEXIBLE TYPE any;
+DEFINE FIELD IF NOT EXISTS context ON fact;
 DEFINE FIELD IF NOT EXISTS steps ON fact TYPE array DEFAULT [];
 DEFINE FIELD IF NOT EXISTS error ON fact TYPE string DEFAULT "";
 DEFINE FIELD IF NOT EXISTS fix ON fact TYPE string DEFAULT "";
@@ -42,7 +42,7 @@ DEFINE INDEX IF NOT EXISTS idx_fact_name ON fact FIELDS fact_type, name, agent_i
 DEFINE INDEX IF NOT EXISTS idx_fact_type ON fact FIELDS fact_type;
 DEFINE INDEX IF NOT EXISTS idx_fact_agent ON fact FIELDS agent_id;
 -- SurrealDB v2 MTREE: no DISTANCE COSINE TYPE F64 suffix
-DEFINE INDEX IF NOT EXISTS idx_fact_mtree ON fact FIELDS embedding MTREE DIMENSION 1536;
+DEFINE INDEX IF NOT EXISTS idx_fact_mtree ON fact FIELDS embedding HNSW DIMENSION 768 TYPE F32;
 
 -- ============================================================
 -- Layer 1: FACETS (语义维度)
@@ -57,7 +57,7 @@ DEFINE FIELD IF NOT EXISTS created_at ON facet TYPE datetime DEFAULT time::now()
 DEFINE FIELD IF NOT EXISTS updated_at ON facet TYPE datetime DEFAULT time::now();
 
 DEFINE INDEX IF NOT EXISTS idx_facet_name ON facet FIELDS name UNIQUE;
-DEFINE INDEX IF NOT EXISTS idx_facet_mtree ON facet FIELDS embedding MTREE DIMENSION 1536;
+DEFINE INDEX IF NOT EXISTS idx_facet_mtree ON facet FIELDS embedding HNSW DIMENSION 768 TYPE F32;
 
 -- ============================================================
 -- Layer 2: EPISODES (事件上下文 - 核心检索返回目标)
@@ -75,7 +75,7 @@ DEFINE FIELD IF NOT EXISTS output ON episode TYPE string DEFAULT "";
 DEFINE FIELD IF NOT EXISTS task_count ON episode TYPE int DEFAULT 0;
 DEFINE FIELD IF NOT EXISTS session_id ON episode TYPE string DEFAULT "";
 DEFINE FIELD IF NOT EXISTS consolidated ON episode TYPE bool DEFAULT false;
-DEFINE FIELD IF NOT EXISTS consolidated_at ON episode FLEXIBLE TYPE any;
+DEFINE FIELD IF NOT EXISTS consolidated_at ON episode;
 DEFINE FIELD IF NOT EXISTS created_at ON episode TYPE datetime DEFAULT time::now();
 DEFINE FIELD IF NOT EXISTS updated_at ON episode TYPE datetime DEFAULT time::now();
 
@@ -94,11 +94,11 @@ DEFINE FIELD IF NOT EXISTS fix ON episode TYPE string DEFAULT "";
 DEFINE FIELD IF NOT EXISTS access_count ON episode TYPE int DEFAULT 0;
 
 DEFINE INDEX IF NOT EXISTS idx_episode_title ON episode FIELDS title;
-DEFINE INDEX IF NOT EXISTS idx_episode_mtree ON episode FIELDS embedding MTREE DIMENSION 1536;
+DEFINE INDEX IF NOT EXISTS idx_episode_mtree ON episode FIELDS embedding HNSW DIMENSION 768 TYPE F32;
 
 -- Full-text search analyzer (SurrealDB v2 compatible)
 DEFINE ANALYZER IF NOT EXISTS search_analyzer TOKENIZERS blank,class FILTERS lowercase;
-DEFINE INDEX IF NOT EXISTS idx_episode_ft ON episode FIELDS summary SEARCH ANALYZER search_analyzer;
+-- DEFINE INDEX IF NOT EXISTS idx_episode_ft ON episode FIELDS summary SEARCH ANALYZER search_analyzer;
 
 -- ============================================================
 -- Layer 3: PROJECTS (锥底 - 项目全景)
@@ -117,7 +117,7 @@ DEFINE FIELD IF NOT EXISTS confidence ON project TYPE float DEFAULT 0.5;
 DEFINE FIELD IF NOT EXISTS tags ON project TYPE array DEFAULT [];
 
 DEFINE INDEX IF NOT EXISTS idx_project_name ON project FIELDS name UNIQUE;
-DEFINE INDEX IF NOT EXISTS idx_project_mtree ON project FIELDS embedding MTREE DIMENSION 1536;
+DEFINE INDEX IF NOT EXISTS idx_project_mtree ON project FIELDS embedding HNSW DIMENSION 768 TYPE F32;
 
 -- ============================================================
 -- 语义边: 节点间关系，每条边有自然语言描述 + 向量化
@@ -134,7 +134,7 @@ DEFINE FIELD IF NOT EXISTS created_at ON edge TYPE datetime DEFAULT time::now();
 
 DEFINE INDEX IF NOT EXISTS idx_edge_source ON edge FIELDS source_id;
 DEFINE INDEX IF NOT EXISTS idx_edge_target ON edge FIELDS target_id;
-DEFINE INDEX IF NOT EXISTS idx_edge_mtree ON edge FIELDS embedding MTREE DIMENSION 1536;
+DEFINE INDEX IF NOT EXISTS idx_edge_mtree ON edge FIELDS embedding HNSW DIMENSION 768 TYPE F32;
 
 -- ============================================================
 -- 图关系定义 (SurrealDB RELATE)
@@ -162,18 +162,18 @@ DEFINE FIELD IF NOT EXISTS agent_id ON agent_registry TYPE string;
 DEFINE FIELD IF NOT EXISTS status ON agent_registry TYPE string;
 DEFINE FIELD IF NOT EXISTS expert_profile ON agent_registry TYPE any;
 DEFINE FIELD IF NOT EXISTS created_at ON agent_registry TYPE datetime DEFAULT time::now();
-DEFINE FIELD IF NOT EXISTS destroyed_at ON agent_registry FLEXIBLE TYPE any;
+DEFINE FIELD IF NOT EXISTS destroyed_at ON agent_registry;
 DEFINE INDEX IF NOT EXISTS idx_agent_id ON agent_registry FIELDS agent_id UNIQUE;
 
 -- 任务表
 DEFINE TABLE IF NOT EXISTS task_registry SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS task_id ON task_registry TYPE string;
-DEFINE FIELD IF NOT EXISTS parent_id ON task_registry FLEXIBLE TYPE any;
+DEFINE FIELD IF NOT EXISTS parent_id ON task_registry;
 DEFINE FIELD IF NOT EXISTS scope ON task_registry TYPE string;
 DEFINE FIELD IF NOT EXISTS status ON task_registry TYPE string;
 DEFINE FIELD IF NOT EXISTS priority ON task_registry TYPE int;
-DEFINE FIELD IF NOT EXISTS assigned_agent ON task_registry FLEXIBLE TYPE any;
-DEFINE FIELD IF NOT EXISTS branch_space ON task_registry FLEXIBLE TYPE any;
+DEFINE FIELD IF NOT EXISTS assigned_agent ON task_registry;
+DEFINE FIELD IF NOT EXISTS branch_space ON task_registry;
 DEFINE FIELD IF NOT EXISTS result ON task_registry TYPE any;
 DEFINE FIELD IF NOT EXISTS created_at ON task_registry TYPE datetime DEFAULT time::now();
 DEFINE FIELD IF NOT EXISTS updated_at ON task_registry TYPE datetime DEFAULT time::now();

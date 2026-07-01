@@ -1,7 +1,7 @@
 """Embedding service for memory vectorization.
 
 Supports multiple providers:
-  1. OpenAI text-embedding-3-small (default, 1536 dims)
+  1. OpenAI text-embedding-004 (default, 1536 dims)
   2. OpenAI text-embedding-3-large (3072 dims)
   3. Local sentence-transformers (bge-large-zh, 1024 dims)
   4. Mock embedding (for testing, deterministic random vectors)
@@ -10,7 +10,7 @@ Configured via agent-loop.yaml:
   memory:
     embedding:
       provider: "openai"  # or "local" or "mock"
-      model: "text-embedding-3-small"
+      model: "text-embedding-004"
       api_key: "${OPENAI_API_KEY}"
       dimensions: 1536
       batch_size: 100
@@ -31,9 +31,9 @@ logger = logging.getLogger(__name__)
 class EmbeddingConfig:
     """Embedding service configuration."""
     provider: str = "mock"  # mock | openai | local
-    model: str = "text-embedding-3-small"
+    model: str = "text-embedding-004"
     api_key: str = ""
-    dimensions: int = 1536
+    dimensions: int = 768
     batch_size: int = 100
     cache_enabled: bool = True
 
@@ -64,7 +64,7 @@ class MockEmbeddingProvider(EmbeddingProvider):
     Uses hash-based pseudo-random vectors. Same text → same vector.
     """
 
-    def __init__(self, dimensions: int = 1536):
+    def __init__(self, dimensions: int = 768):
         self._dimensions = dimensions
 
     @property
@@ -87,8 +87,8 @@ class MockEmbeddingProvider(EmbeddingProvider):
 class OpenAIEmbeddingProvider(EmbeddingProvider):
     """OpenAI text-embedding API provider."""
 
-    def __init__(self, api_key: str, model: str = "text-embedding-3-small",
-                 dimensions: int = 1536, batch_size: int = 100):
+    def __init__(self, api_key: str, model: str = "text-embedding-004",
+                 dimensions: int = 768, batch_size: int = 100):
         self._api_key = api_key
         self._model = model
         self._dimensions = dimensions

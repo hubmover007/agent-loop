@@ -411,7 +411,7 @@ confidence: 0.8
             # Search fact table for lessons
             if hasattr(self.memory, "_db") and self.memory._db:
                 results = await self.memory._db.query(
-                    """SELECT *, vector::distance::cosine(embedding, $query_vector) AS _dist
+                    """SELECT *, vector::similarity::cosine(embedding, $query_vector) AS _dist
                        FROM fact
                        WHERE type = 'lesson'
                        AND ($project = '' OR project = $project)

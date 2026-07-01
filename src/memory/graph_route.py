@@ -156,7 +156,7 @@ class GraphRouter:
         """Vector similarity search on a table."""
         try:
             result = await self.pool._db.query(f"""
-                SELECT *, vector::distance::cosine(embedding, $query_embedding) AS _dist
+                SELECT *, vector::similarity::cosine(embedding, $query_embedding) AS _dist
                 FROM {table}
                 WHERE embedding IS NOT NONE
                 ORDER BY _dist ASC

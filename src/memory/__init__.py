@@ -23,7 +23,7 @@ _Surreal: Any = None  # lazily resolved in connect()
 logger = logging.getLogger(__name__)
 
 # Default embedding dimension (configurable)
-DEFAULT_EMBEDDING_DIM = 1536
+DEFAULT_EMBEDDING_DIM = 768
 
 
 class MemoryPool:

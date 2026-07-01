@@ -7,7 +7,7 @@ memory:
     provider: "mock"  # mock | openai | local
     model: "text-embedding-3-small"
     api_key: "${OPENAI_API_KEY}"
-    dimensions: 1536
+    dimensions: 768
     batch_size: 100
     cache_enabled: true
 
