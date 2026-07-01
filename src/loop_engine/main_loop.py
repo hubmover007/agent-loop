@@ -1,15 +1,23 @@
 """MainLoop - the outermost Loop Engine cycle.
 
 INPUT → RETRIEVE → REASON → DECOMPOSE → DISPATCH → COLLECT → OUTPUT
+
+Intent classification:
+  - Level 1 (chat):    simple Q&A → _simple_run (<5s)
+  - Level 2 (analysis): reasoning/comparison → _analysis_run (<15s)
+  - Level 3 (complex): multi-step tasks → full pipeline with decompose
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
 from . import LoopConfig, LoopContext, AgentLoop, ToolLoop, LLMProvider
 from .deep_reason import DeepReasonLoop, DeepReasonConfig
@@ -19,6 +27,8 @@ from ..memory import MemoryPool
 from ..memory.graph_route import GraphRouter
 from ..system_agents import TaskAgent, AgentManagerAgent, TaskRegistry
 from ..memory.unified_retrieval import UnifiedRetriever, MemoryContext
+from ..project import Project, ProjectCard
+from ..ammo import AmmoBox, AmmoRefiller
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +60,9 @@ class MainLoop:
                  tracer: Any | None = None,
                  anchor_manager: Any | None = None,
                  cost_controller: Any | None = None,
-                 llm_pool: Any | None = None):
+                 llm_pool: Any | None = None,
+                 project: Project | None = None,
+                 project_root: str | Path | None = None):
         self.memory = memory
         self.llm = llm
         self.config = config or LoopConfig()
@@ -60,6 +72,14 @@ class MainLoop:
         self.cost_controller = cost_controller  # Optional CostController for budget management
         self.llm_pool = llm_pool  # Optional LLMPool for capability-based model selection
 
+        # Project workspace (shared space for all agents)
+        if project:
+            self.project = project
+        elif project_root:
+            self.project = Project(project_root)
+        else:
+            self.project = None  # No project context (backward compat)
+
         # System Agents: TaskAgent (manages tasks) + AgentManagerAgent (manages agents)
         self.task_agent: TaskAgent | None = None
         self.agent_manager: AgentManagerAgent | None = None
@@ -68,7 +88,10 @@ class MainLoop:
         # Sub-systems
         from ..tools.base import ToolRegistry
         self.tool_registry = ToolRegistry()
-        self.tool_registry.register_defaults()
+        if self.project:
+            self.tool_registry.register_defaults(code_workspace=str(self.project.workspace))
+        else:
+            self.tool_registry.register_defaults()
         self.tool_loop = ToolLoop(self.tool_registry, self.config)
         self.graph_router = GraphRouter(memory)  # M-FLOW graph routing
         self.agent_loop = AgentLoop(self.tool_loop, llm, self.config, llm_pool=llm_pool)
@@ -394,7 +417,7 @@ class MainLoop:
         if ctx.errors:
             ctx.final_output += "\n\n⚠️ Issues encountered:\n" + "\n".join(f"- {e}" for e in ctx.errors)
 
-        # Write a new Episode to memory for future retrieval
+        # Write a new Episode to memory with project_id
         try:
             await self.memory.store({
                 "type": "episode",
@@ -405,10 +428,29 @@ class MainLoop:
                 "content": ctx.reason_output,
                 "task_count": len(ctx.task_ids),
                 "session_id": ctx.session_id,
+                "project": self.project.project_id if self.project else "",
                 "tags": ["session", datetime.now(timezone.utc).strftime("%Y-%m-%d")],
             })
         except Exception as e:
             logger.warning("Failed to write episode: %s", e)
+
+        # Update project card
+        if self.project:
+            self.project.save_session_summary(
+                ctx.session_id,
+                ctx.final_output[:200],
+                ctx.user_input[:200],
+                ctx.final_output[:200],
+            )
+            card = self.project.load_card()
+            card.update_session(
+                ctx.session_id,
+                ctx.final_output[:200],
+                ctx.user_input[:200],
+                ctx.final_output[:200],
+            )
+            # Cleanup worker findings
+            self.project.cleanup_findings()
 
         # Save session state
         await self._save_session(ctx)
@@ -523,7 +565,203 @@ class MainLoop:
         ctx.metrics.finish()
         logger.info("MainLoop[%s]: SIMPLE_RUN metrics\n%s", ctx.session_id, ctx.metrics.summary())
 
-        # Save episode
+        # Save episode with project_id
+        await self._save_episode(ctx, tags=["session", "simple"])
+
+        # Update project card
+        if self.project:
+            self.project.save_session_summary(
+                ctx.session_id,
+                ctx.final_output[:200],
+                ctx.user_input[:200],
+                ctx.final_output[:200],
+            )
+            card = self.project.load_card()
+            card.update_session(
+                ctx.session_id,
+                ctx.final_output[:200],
+                ctx.user_input[:200],
+                ctx.final_output[:200],
+            )
+
+        await self._save_session(ctx)
+        return ctx
+
+    async def _analysis_run(self, ctx: LoopContext,
+                           task_handle: Any = None) -> LoopContext:
+        """Level 2: Analysis/comparison queries — single agent + ammo box.
+
+        Skips: DECOMPOSE, DISPATCH, COLLECT.
+        Runs: INPUT + RETRIEVE + REASON (with ammo) + OUTPUT.
+        Returns in <15 seconds.
+        """
+        t0 = time.time()
+        logger.info("MainLoop[%s]: ANALYSIS_RUN for '%s'", ctx.session_id, ctx.user_input[:50])
+
+        # Init ammo box
+        ammo = self._init_ammo_box()
+
+        async def _check():
+            if task_handle:
+                await task_handle.wait_if_paused()
+                return await task_handle.check_cancelled()
+            return False
+
+        # Phase: INPUT
+        ctx.metrics.start_phase("input")
+        ctx.metrics.end_phase("input")
+
+        if await _check():
+            ctx.final_output = "任务已取消"
+            return ctx
+
+        # Phase: RETRIEVE (with project filter)
+        ctx.metrics.start_phase("retrieve")
+        try:
+            ctx.current_phase = LoopPhase.RETRIEVE
+            mem_ctx = await asyncio.wait_for(
+                self.retriever.retrieve(
+                    query=ctx.user_input,
+                    max_hops=3,
+                    deep_reason_iterations=0,
+                ),
+                timeout=10.0,
+            )
+            ctx.memory_context = mem_ctx
+            # Add retrieved context to ammo
+            if mem_ctx and mem_ctx.explicit:
+                for item in mem_ctx.explicit[:3]:
+                    summary = item.get("summary", "")[:200]
+                    if summary:
+                        if ammo:
+                            ammo.add_fact(summary, source="retrieve")
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning("Analysis retrieve skipped: %s", e)
+        ctx.metrics.end_phase("retrieve")
+
+        if await _check():
+            ctx.final_output = "任务已取消"
+            return ctx
+
+        # Phase: REASON (with ammo context)
+        ctx.metrics.start_phase("reason")
+        try:
+            # Build context from ammo box
+            ammo_context = ammo.to_context() if ammo else ""
+
+            system_prompt = "You are a helpful assistant. Answer thoroughly and clearly."
+            if ammo_context:
+                system_prompt += f"\n\n--- Project Context ---\n{ammo_context}"
+
+            # Check for @project mention → deeper retrieval
+            if self._detect_project_mention(ctx.user_input) and self.project:
+                deeper = await self._search_project_memory(ctx.user_input)
+                if deeper:
+                    system_prompt += f"\n\n--- Deep Memory ---\n{deeper}"
+
+            llm = self._get_llm(["reasoning"], "balanced")
+            resp = await asyncio.wait_for(
+                llm.chat_with_retry(
+                    [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": ctx.user_input},
+                    ],
+                    max_retries=2,
+                    timeout=20.0,
+                ),
+                timeout=25.0,
+            )
+            ctx.final_output = resp.content
+            ctx.reason_output = resp.content
+
+            # Record token usage
+            if hasattr(resp, 'usage') and resp.usage:
+                pt = resp.usage.get('input_tokens', resp.usage.get('prompt_tokens', 0))
+                ct = resp.usage.get('output_tokens', resp.usage.get('completion_tokens', 0))
+                ctx.metrics.record_llm_call(prompt_tokens=pt, completion_tokens=ct)
+            else:
+                ctx.metrics.record_llm_call()
+
+            ctx.metrics.end_phase("reason")
+            logger.info(
+                "MainLoop[%s]: ANALYSIS_RUN done (%.1fs)",
+                ctx.session_id, time.time() - t0,
+            )
+        except asyncio.TimeoutError:
+            ctx.metrics.end_phase("reason")
+            ctx.metrics.record_error()
+            ctx.final_output = "抱歉，分析超时了，请简化问题再试。"
+            ctx.errors.append("Analysis LLM timeout")
+        except Exception as e:
+            ctx.metrics.end_phase("reason")
+            ctx.metrics.record_error()
+            ctx.final_output = f"处理出错: {e}"
+            ctx.errors.append(str(e))
+
+        ctx.metrics.start_phase("output")
+        ctx.metrics.end_phase("output")
+        ctx.metrics.finish()
+
+        # Save episode with project_id
+        await self._save_episode(ctx, tags=["session", "analysis"])
+
+        # Update project card
+        if self.project:
+            self.project.save_session_summary(
+                ctx.session_id,
+                ctx.final_output[:200],
+                ctx.user_input[:200],
+                ctx.final_output[:200],
+            )
+            card = self.project.load_card()
+            card.update_session(
+                ctx.session_id,
+                ctx.final_output[:200],
+                ctx.user_input[:200],
+                ctx.final_output[:200],
+            )
+
+        await self._save_session(ctx)
+        return ctx
+
+    async def _search_project_memory(self, query: str) -> str:
+        """Deep search project memory for @project queries."""
+        if not self.memory:
+            return ""
+
+        project_filter = ""
+        if self.project:
+            project_filter = f"AND project = '{self.project.project_id}'"
+
+        try:
+            if hasattr(self.memory, '_db') and self.memory._db:
+                result = await self.memory._db.query(f"""
+                    SELECT * FROM episode
+                    WHERE summary != ''
+                    {project_filter}
+                    ORDER BY created_at DESC
+                    LIMIT 5
+                """)
+                if isinstance(result, list):
+                    items = result
+                elif isinstance(result, dict) and "result" in result:
+                    items = result["result"]
+                else:
+                    items = []
+
+                parts = []
+                for item in items:
+                    summary = item.get("summary", "")[:200]
+                    if summary:
+                        parts.append(f"- {summary}")
+                return "\n".join(parts)
+        except Exception as e:
+            logger.warning("Project memory search failed: %s", e)
+
+        return ""
+
+    async def _save_episode(self, ctx: LoopContext, tags: list[str] | None = None) -> None:
+        """Save session as episode to memory."""
         try:
             await asyncio.wait_for(
                 self.memory.store({
@@ -532,15 +770,13 @@ class MainLoop:
                     "user_input": ctx.user_input,
                     "output": ctx.final_output,
                     "session_id": ctx.session_id,
-                    "tags": ["session", "simple", datetime.now(timezone.utc).strftime("%Y-%m-%d")],
+                    "project": self.project.project_id if self.project else "",
+                    "tags": tags or ["session", datetime.now(timezone.utc).strftime("%Y-%m-%d")],
                 }),
                 timeout=3.0,
             )
         except Exception:
             pass
-
-        await self._save_session(ctx)
-        return ctx
 
     async def _save_session(self, ctx: LoopContext) -> None:
         """Save session state to StateStore if available."""
@@ -576,6 +812,68 @@ class MainLoop:
             return False
         lower = text.lower()
         return not any(k in lower for k in COMPLEX_KEYWORDS)
+
+    def _classify_intent(self, text: str) -> str:
+        """Classify user intent into 3 levels.
+
+        Returns:
+            "chat"     — Level 1: simple Q&A, direct LLM response
+            "analysis"  — Level 2: reasoning/analysis, single agent + ammo
+            "complex"   — Level 3: multi-step tasks, full pipeline
+        """
+        # Level 1: short + no complex keywords
+        if self._is_simple_query(text):
+            return "chat"
+
+        # Analysis keywords: comparison, analysis, summary, explain
+        analysis_keywords = [
+            "分析", "对比", "比较", "总结", "解释", "区别",
+            "analyze", "compare", "summary", "explain", "difference",
+            "vs", "versus", "pros", "cons",
+        ]
+        lower = text.lower()
+        is_analysis = any(kw in lower for kw in analysis_keywords)
+
+        # Multi-step keywords: deploy, create project, fix bug, build, migrate
+        multi_step_keywords = [
+            "部署", "创建项目", "修复", "修bug", "构建", "迁移",
+            "deploy", "create project", "build", "migrate", "install",
+            "write code", "写代码", "实现", "implement", "fix", "debug",
+        ]
+        is_multi_step = any(kw in lower for kw in multi_step_keywords)
+
+        if is_multi_step:
+            return "complex"
+        if is_analysis and len(text) < 200:
+            return "analysis"
+        if len(text) > 500:
+            return "complex"
+        return "analysis"
+
+    def _detect_project_mention(self, text: str) -> bool:
+        """Detect if user explicitly mentions @project."""
+        return bool(re.search(r'@project', text, re.IGNORECASE))
+
+    def _init_ammo_box(self) -> AmmoBox | None:
+        """Initialize AmmoBox with project card and recent context."""
+        if not self.project:
+            return None
+
+        ammo = AmmoBox(max_tokens=2000)
+
+        # Layer 1: Project Card (auto-injected)
+        card = self.project.load_card()
+        ammo.add_pinned(card.to_context(), source="project_card")
+
+        # Layer 2: Recent context (auto-injected)
+        recent = self.project.load_recent_sessions(limit=3)
+        if recent:
+            recent_text = "## 最近会话\n"
+            for s in recent:
+                recent_text += f"- {s.get('summary', '')[:100]}\n"
+            ammo.add_pinned(recent_text, source="recent")
+
+        return ammo
 
     async def run(self, user_input: str | list[MediaInput], task_handle: Any = None) -> LoopContext:
         """Execute the complete MainLoop cycle.
@@ -626,14 +924,19 @@ class MainLoop:
         logger.info("=" * 60)
         logger.info("MainLoop[%s]: START", ctx.session_id)
 
-        # ── Simple query fast path ────────────────────────────
+        # ── Intent classification: 3-level routing ─────────
         text_input = ctx.user_input if not isinstance(user_input, list) else (
             " ".join(m.source for m in user_input if m.type == "text")
         )
         if (not isinstance(user_input, list)
-                and not ctx.media_blocks
-                and self._is_simple_query(text_input)):
-            return await self._simple_run(ctx, task_handle)
+                and not ctx.media_blocks):
+            intent = self._classify_intent(text_input)
+            logger.info("MainLoop[%s]: intent='%s'", ctx.session_id, intent)
+            if intent == "chat":
+                return await self._simple_run(ctx, task_handle)
+            elif intent == "analysis":
+                return await self._analysis_run(ctx, task_handle)
+            # else: complex → full pipeline below
 
         # Tracing: start root span
         loop_span = None

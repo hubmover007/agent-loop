@@ -241,7 +241,9 @@ def cmd_chat(args):
         llm, llm_pool = _create_llm_from_config(args)
 
         config = LoopConfig()
-        loop = MainLoop(memory=memory, llm=llm, config=config, llm_pool=llm_pool)
+        project_root = getattr(args, 'project', None) or str(Path.cwd())
+        loop = MainLoop(memory=memory, llm=llm, config=config, llm_pool=llm_pool,
+                        project_root=project_root)
 
         # Run
         print(f"User: {args.message}")
@@ -1124,6 +1126,8 @@ def main():
                         help="LLM provider (default: auto from llm_pool.json)")
     p_chat.add_argument("--api-key", default=None,
                         help="API key (default: from environment)")
+    p_chat.add_argument("--project", default=None,
+                        help="Project directory (default: current dir)")
     p_chat.set_defaults(func=cmd_chat)
 
     # serve
