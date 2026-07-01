@@ -149,29 +149,29 @@ class UnifiedRetriever:
             graph_results = []
 
         # ---- Phase 2: Implicit Deep Reasoning (Mythos) ----
-        # ALWAYS run deep reasoning, even if graph returned nothing.
-        # This activates parametric knowledge (Mythos-style recall).
-        try:
-            # Build context from graph results
-            graph_context = self._format_graph_context(graph_results)
+        # Skip deep reasoning if iterations=0 (simple query fast path)
+        if deep_reason_iterations > 0:
+            try:
+                # Build context from graph results
+                graph_context = self._format_graph_context(graph_results)
 
-            # DeepReason iterates to cross-reference and synthesize
-            # This is where Mythos-style parametric recall happens:
-            # the model "remembers" knowledge encoded in its weights
-            reason_state = await self.deep_reason.reason(
-                query=f"Recall and synthesize knowledge relevant to: {query}",
-                context=graph_context,
-            )
+                # DeepReason iterates to cross-reference and synthesize
+                # This is where Mythos-style parametric recall happens:
+                # the model "remembers" knowledge encoded in its weights
+                reason_state = await self.deep_reason.reason(
+                    query=f"Recall and synthesize knowledge relevant to: {query}",
+                    context=graph_context,
+                )
 
-            context.implicit = reason_state.current_thought
-            context.confidence = reason_state.confidence
-            context.reason_iterations = reason_state.iteration
+                context.implicit = reason_state.current_thought
+                context.confidence = reason_state.confidence
+                context.reason_iterations = reason_state.iteration
 
-            logger.debug("UnifiedRetriever: deep reason iter=%d conf=%.2f",
-                        reason_state.iteration, reason_state.confidence)
+                logger.debug("UnifiedRetriever: deep reason iter=%d conf=%.2f",
+                            reason_state.iteration, reason_state.confidence)
 
-        except Exception as e:
-            logger.warning("UnifiedRetriever: deep reason failed: %s", e)
+            except Exception as e:
+                logger.warning("UnifiedRetriever: deep reason failed: %s", e)
 
         return context
 
