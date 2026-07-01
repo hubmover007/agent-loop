@@ -83,6 +83,20 @@ class ToolRegistry:
             from .openclaw_bridge import register_openclaw_skills
             register_openclaw_skills(self)
 
+        # Browser tool (optional, requires playwright)
+        if kwargs.get("enable_browser", True):
+            try:
+                from .browser import BrowserTool
+                self.register(BrowserTool(headless=True))
+            except ImportError:
+                logger = __import__("logging").getLogger(__name__)
+                logger.info("BrowserTool not available (install playwright)")
+
+        # Canvas tool (zero external deps — pure HTML generation)
+        if kwargs.get("enable_canvas", True):
+            from .canvas import CanvasTool
+            self.register(CanvasTool())
+
         # Auto-register any future tools here
         logger = __import__("logging").getLogger(__name__)
         logger.info("Registered %d default tools: %s",

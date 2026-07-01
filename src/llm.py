@@ -380,7 +380,10 @@ class OpenAICompatibleProvider(LLMProvider):
         texts = [text] if isinstance(text, str) else text
 
         try:
-            resp = await self._client.post("/v1/embeddings", json={
+            # Build the embedding URL explicitly to avoid httpx base_url
+            # path resolution issues (double /v1 prefix).
+            embed_url = f"{self.base_url}/embeddings"
+            resp = await self._client.post(embed_url, json={
                 "model": model or self.embedding_model or self.default_model,
                 "input": texts,
             })

@@ -40,7 +40,7 @@ DEFAULT_TIMEOUT_SECONDS = 300
 class LoopConfig:
     """Configuration for the Loop Engine."""
     # MainLoop
-    max_reason_loops: int = 5           # Max internal reasoning iterations
+    max_reason_loops: int = 3           # Max internal reasoning iterations (reduced for responsiveness)
     reason_confidence_threshold: float = 0.85  # ACT: stop when confidence > threshold
     max_agent_concurrent: int = 50       # Max concurrent agents
 

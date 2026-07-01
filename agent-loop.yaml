@@ -17,7 +17,7 @@ llm:
   model: "deepseek-chat"
 
 loop:
-  max_reason_loops: 8
+  max_reason_loops: 3
   reason_confidence_threshold: 0.85
   max_agent_concurrent: 10
   accept_threshold: 0.7

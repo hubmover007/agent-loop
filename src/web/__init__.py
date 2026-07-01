@@ -336,6 +336,19 @@ def create_app(memory: MemoryPool, llm: LLMProvider,
             ],
         }
 
+    # ── Canvas serving ────────────────────────────────────
+    @app.get("/canvas/{canvas_id}")
+    async def serve_canvas(canvas_id: str):
+        """Serve a rendered canvas HTML file."""
+        import os as _os
+        from fastapi.responses import HTMLResponse as _HTMLResponse
+        path = f"state/canvas/{canvas_id}.html"
+        if not _os.path.exists(path):
+            from fastapi import HTTPException as _HTTPException
+            raise _HTTPException(404, f"Canvas '{canvas_id}' not found")
+        with open(path, "r", encoding="utf-8") as f:
+            return _HTMLResponse(content=f.read())
+
     # Static file serving for frontend UI (must be last, after all routes)
     from starlette.staticfiles import StaticFiles
     web_root = Path(__file__).parent.parent.parent / "web"
