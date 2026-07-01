@@ -164,17 +164,19 @@ async def test_e2e_full_mainloop():
 
     # ---- ASSERTIONS ----
 
-    # 1. ctx.final_output is non-empty
+    # 1. result is a LoopContext with final_output
     assert result is not None, "result should not be None"
-    assert isinstance(result, str), "result should be a string"
-    print(f"✅ final_output: {result[:100]}...")
+    from src.loop_engine import LoopContext
+    assert isinstance(result, LoopContext), f"result should be LoopContext, got {type(result)}"
+    assert result.final_output, "final_output should not be empty"
+    print(f"✅ final_output: {result.final_output[:100]}...")
 
     # 2. LLM was called multiple times (at least for decompose + plan + self-eval + summary)
     assert llm._call_count > 0, "LLM should have been called at least once"
     print(f"✅ LLM call count: {llm._call_count}")
 
     # 3. DECOMPOSE produced >= 1 task
-    task_count = len(main_loop.task_registry._order)
+    task_count = len(result.task_ids)
     assert task_count >= 1, f"DECOMPOSE should produce >= 1 task, got {task_count}"
     print(f"✅ Tasks created: {task_count}")
 

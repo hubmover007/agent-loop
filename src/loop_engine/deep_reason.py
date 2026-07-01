@@ -16,12 +16,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from . import LLMProvider, LLMResponse
 
 logger = logging.getLogger(__name__)
+
+# Max total time for deep reasoning before forced stop
+DEEP_REASON_TOTAL_TIMEOUT = 25.0  # seconds
 
 
 @dataclass
@@ -67,17 +71,22 @@ class DeepReasonLoop:
         self.config = config or DeepReasonConfig()
 
     async def reason(self, query: str, context: str = "",
-                     system_prompt: str | None = None) -> ReasonState:
+                     system_prompt: str | None = None,
+                     total_timeout: float | None = None) -> ReasonState:
         """Execute the deep reasoning loop.
 
         Args:
             query: The user's question or task
             context: Retrieved memory context
             system_prompt: Optional system prompt
+            total_timeout: Max total seconds for the reasoning loop (default 25)
 
         Returns:
             ReasonState with the final reasoning output and metadata
         """
+        _timeout = total_timeout if total_timeout is not None else DEEP_REASON_TOTAL_TIMEOUT
+        loop_start = time.time()
+
         state = ReasonState(
             iteration=0,
             input_context=query,
@@ -94,6 +103,14 @@ class DeepReasonLoop:
         ]
 
         for iteration in range(1, self.config.max_iterations + 1):
+            # Total timeout guard
+            if time.time() - loop_start > _timeout:
+                logger.warning(
+                    "DeepReason: total timeout %.1fs after %d iterations",
+                    _timeout, iteration - 1,
+                )
+                break
+
             state.iteration = iteration
 
             # Temperature annealing: cooler as we converge

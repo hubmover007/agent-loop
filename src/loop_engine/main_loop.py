@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -19,6 +20,24 @@ from ..system_agents import TaskAgent, AgentManagerAgent, TaskRegistry
 from ..memory.unified_retrieval import UnifiedRetriever, MemoryContext
 
 logger = logging.getLogger(__name__)
+
+# Phase timeout defaults (seconds)
+PHASE_TIMEOUTS: dict[str, float] = {
+    "_input": 5.0,
+    "_retrieve": 15.0,
+    "_reason": 20.0,
+    "_decompose": 15.0,
+    "_dispatch": 10.0,
+    "_collect": 60.0,
+    "_output": 10.0,
+}
+
+# Keywords that indicate a complex query requiring full pipeline
+COMPLEX_KEYWORDS: list[str] = [
+    "搜索", "分析", "写代码", "部署", "创建", "修复", "生成",
+    "search", "analyze", "code", "deploy", "create", "fix", "generate",
+    "build", "run", "execute", "compile", "debug", "refactor",
+]
 
 
 class MainLoop:
@@ -292,8 +311,8 @@ class MainLoop:
             ctx.errors.append("System agents not initialized")
             return
 
-        # AgentManagerAgent waits for all workers to finish
-        results = await self.agent_manager.collect_all(timeout=300.0)
+        # AgentManagerAgent waits for all workers to finish (limited to 30s per phase + extra asyncio.wait_for)
+        results = await self.agent_manager.collect_all(timeout=30.0)
 
         for task_id, result in results.items():
             ctx.agent_results.append(result)
@@ -373,6 +392,105 @@ class MainLoop:
 
         logger.info("MainLoop[%s]: OUTPUT completed", ctx.session_id)
 
+    # ============================================================
+    # Simple Run (fast path for trivial questions)
+    # ============================================================
+
+    async def _simple_run(self, ctx: LoopContext,
+                          task_handle: Any = None) -> LoopContext:
+        """Fast path for simple queries: direct LLM response.
+
+        Skips: REASON, DECOMPOSE, DISPATCH, COLLECT phases.
+        Only runs: INPUT (no-op) + minimal RETRIEVE + direct LLM call.
+
+        Returns in <5 seconds for trivial questions like "1+1=?".
+        """
+        t0 = time.time()
+        logger.info("MainLoop[%s]: SIMPLE_RUN for '%s'", ctx.session_id, ctx.user_input[:50])
+
+        async def _check():
+            if task_handle:
+                await task_handle.wait_if_paused()
+                return await task_handle.check_cancelled()
+            return False
+
+        # Phase: INPUT
+        if await _check():
+            ctx.final_output = "任务已取消"
+            return ctx
+
+        # Phase: RETRIEVE (lightweight — skip DeepReason in retriever)
+        try:
+            ctx.current_phase = LoopPhase.RETRIEVE
+            mem_ctx = await asyncio.wait_for(
+                self.retriever.retrieve(
+                    query=ctx.user_input,
+                    max_hops=2,
+                    deep_reason_iterations=0,  # No deep reasoning for simple queries
+                ),
+                timeout=10.0,
+            )
+            ctx.memory_context = mem_ctx
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning("Simple retrieve skipped: %s", e)
+
+        if await _check():
+            ctx.final_output = "任务已取消"
+            return ctx
+
+        # Build concise context
+        context_text = ""
+        if ctx.memory_context and ctx.memory_context.explicit:
+            context_text = "\n".join(
+                f"[{rc.get('layer', '?')}] {rc.get('title', '')}: {rc.get('summary', '')}"
+                for rc in ctx.memory_context.explicit[:3]
+            )
+
+        # Single LLM call — no iterative reasoning
+        try:
+            system_prompt = "You are a helpful assistant. Answer concisely and directly."
+            if context_text:
+                system_prompt += f"\n\nRelevant context:\n{context_text}"
+
+            resp = await asyncio.wait_for(
+                self.llm.chat([
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": ctx.user_input},
+                ]),
+                timeout=25.0,
+            )
+            ctx.final_output = resp.content
+            ctx.reason_output = resp.content
+            logger.info(
+                "MainLoop[%s]: SIMPLE_RUN done (%.1fs)",
+                ctx.session_id, time.time() - t0,
+            )
+        except asyncio.TimeoutError:
+            ctx.final_output = "抱歉，回复超时了，请再试一次。"
+            ctx.errors.append("Simple query LLM timeout")
+        except Exception as e:
+            ctx.final_output = f"处理出错: {e}"
+            ctx.errors.append(str(e))
+
+        # Save episode
+        try:
+            await asyncio.wait_for(
+                self.memory.store({
+                    "type": "episode",
+                    "title": f"Session: {ctx.user_input[:80]}",
+                    "user_input": ctx.user_input,
+                    "output": ctx.final_output,
+                    "session_id": ctx.session_id,
+                    "tags": ["session", "simple", datetime.now(timezone.utc).strftime("%Y-%m-%d")],
+                }),
+                timeout=3.0,
+            )
+        except Exception:
+            pass
+
+        await self._save_session(ctx)
+        return ctx
+
     async def _save_session(self, ctx: LoopContext) -> None:
         """Save session state to StateStore if available."""
         if not self.state_store:
@@ -397,7 +515,18 @@ class MainLoop:
     # Main Loop
     # ============================================================
 
-    async def run(self, user_input: str | list[MediaInput], task_handle: Any = None) -> str:
+    def _is_simple_query(self, text: str) -> bool:
+        """Check if a query should skip the complex pipeline.
+
+        Simple queries: short, no action keywords → direct LLM response.
+        Complex queries: long, or contains action keywords → full pipeline.
+        """
+        if len(text) > 50:
+            return False
+        lower = text.lower()
+        return not any(k in lower for k in COMPLEX_KEYWORDS)
+
+    async def run(self, user_input: str | list[MediaInput], task_handle: Any = None) -> LoopContext:
         """Execute the complete MainLoop cycle.
 
         Args:
@@ -405,7 +534,7 @@ class MainLoop:
             task_handle: Optional TaskHandle for cancellation/pause/resume support
 
         Returns:
-            The final response text
+            LoopContext with final output and metadata
         """
         # ── Multimodal routing ─────────────────────────────────
         if isinstance(user_input, list):
@@ -431,8 +560,18 @@ class MainLoop:
                 if await task_handle.check_cancelled():
                     return True
             return False
+        run_start = time.time()
         logger.info("=" * 60)
         logger.info("MainLoop[%s]: START", ctx.session_id)
+
+        # ── Simple query fast path ────────────────────────────
+        text_input = ctx.user_input if not isinstance(user_input, list) else (
+            " ".join(m.source for m in user_input if m.type == "text")
+        )
+        if (not isinstance(user_input, list)
+                and not ctx.media_blocks
+                and self._is_simple_query(text_input)):
+            return await self._simple_run(ctx, task_handle)
 
         # Tracing: start root span
         loop_span = None
@@ -458,24 +597,50 @@ class MainLoop:
         ]
 
         for phase in phases:
+            phase_name = phase.__name__
+            phase_timeout = PHASE_TIMEOUTS.get(phase_name, 30.0)
+
             # Tracing: phase span
             phase_span = None
             if self.tracer:
-                phase_span = self.tracer.start_span(f"phase.{phase.__name__}")
+                phase_span = self.tracer.start_span(f"phase.{phase_name}")
+
             # Check for cancellation/pause before each phase
             if await _check_handle():
-                logger.info("MainLoop[%s]: cancelled during %s", ctx.session_id, phase.__name__)
+                logger.info("MainLoop[%s]: cancelled during %s", ctx.session_id, phase_name)
                 ctx.errors.append("Task cancelled by user")
                 ctx.final_output = "任务已取消"
                 break
 
+            phase_start = time.time()
+            logger.info("MainLoop[%s]: phase=%s START", ctx.session_id, phase_name)
+
             try:
-                await phase(ctx)
+                # Run phase with timeout
+                await asyncio.wait_for(phase(ctx), timeout=phase_timeout)
+                phase_elapsed = time.time() - phase_start
+
                 if self.tracer and phase_span:
                     self.tracer.end_span(phase_span, "ok")
+
+                # Log per-phase wall-clock time
+                logger.info(
+                    "MainLoop[%s]: phase=%s DONE (%.1fs)",
+                    ctx.session_id, phase_name, phase_elapsed,
+                )
+
+            except asyncio.TimeoutError:
+                logger.error(
+                    "MainLoop[%s]: phase=%s TIMEOUT after %.1fs",
+                    ctx.session_id, phase_name, phase_timeout,
+                )
+                ctx.errors.append(f"Phase {phase_name} timed out ({phase_timeout}s)")
+                if self.tracer and phase_span:
+                    self.tracer.end_span(phase_span, "timeout")
+
             except Exception as e:
-                logger.error("Phase %s failed: %s", phase.__name__, e)
-                ctx.errors.append(f"Error in {phase.__name__}: {e}")
+                logger.error("Phase %s failed: %s", phase_name, e)
+                ctx.errors.append(f"Error in {phase_name}: {e}")
                 if self.tracer and phase_span:
                     self.tracer.end_span(phase_span, "error")
 
@@ -491,5 +656,6 @@ class MainLoop:
         if self.tracer and loop_span:
             self.tracer.end_span(loop_span, "error" if ctx.errors else "ok")
 
-        logger.info("MainLoop[%s]: END", ctx.session_id)
-        return ctx.final_output
+        elapsed = time.time() - run_start
+        logger.info("MainLoop[%s]: END (%.1fs)", ctx.session_id, elapsed)
+        return ctx
