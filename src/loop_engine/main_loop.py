@@ -823,18 +823,7 @@ class MainLoop:
             "analysis"  — Level 2: reasoning/analysis, single agent + ammo
             "complex"   — Level 3: multi-step tasks, full pipeline
         """
-        # Level 1: short + no complex keywords
-        if self._is_simple_query(text):
-            return "chat"
-
-        # Analysis keywords: comparison, analysis, summary, explain
-        analysis_keywords = [
-            "分析", "对比", "比较", "总结", "解释", "区别",
-            "analyze", "compare", "summary", "explain", "difference",
-            "vs", "versus", "pros", "cons",
-        ]
         lower = text.lower()
-        is_analysis = any(kw in lower for kw in analysis_keywords)
 
         # Multi-step keywords: deploy, create project, fix bug, build, migrate
         multi_step_keywords = [
@@ -842,15 +831,27 @@ class MainLoop:
             "deploy", "create project", "build", "migrate", "install",
             "write code", "写代码", "实现", "implement", "fix", "debug",
         ]
-        is_multi_step = any(kw in lower for kw in multi_step_keywords)
+        if any(kw in lower for kw in multi_step_keywords):
+            return "complex"
 
-        if is_multi_step:
-            return "complex"
-        if is_analysis and len(text) < 200:
+        # Analysis keywords: comparison, analysis, summary, explain
+        analysis_keywords = [
+            "分析", "对比", "比较", "总结", "解释", "区别",
+            "analyze", "compare", "summary", "explain", "difference",
+            "vs", "versus", "pros", "cons",
+        ]
+        if any(kw in lower for kw in analysis_keywords):
             return "analysis"
-        if len(text) > 500:
-            return "complex"
-        return "analysis"
+
+        # Level 1: short + no complex keywords → chat
+        if self._is_simple_query(text):
+            return "chat"
+
+        # Medium length without keywords → analysis (not complex enough for full pipeline)
+        if len(text) < 200:
+            return "analysis"
+
+        return "complex"
 
     def _detect_project_mention(self, text: str) -> bool:
         """Detect if user explicitly mentions @project."""

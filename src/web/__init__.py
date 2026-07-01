@@ -79,7 +79,8 @@ if FastAPI:
 
 def create_app(memory: MemoryPool, llm: LLMProvider,
                config: LoopConfig | None = None,
-               llm_pool: Any | None = None) -> FastAPI:
+               llm_pool: Any | None = None,
+               project_root: str | None = None) -> FastAPI:
     """Create and configure the FastAPI app.
 
     Usage:
@@ -92,7 +93,8 @@ def create_app(memory: MemoryPool, llm: LLMProvider,
         )
 
     config = config or LoopConfig()
-    main_loop = MainLoop(memory=memory, llm=llm, config=config, llm_pool=llm_pool)
+    main_loop = MainLoop(memory=memory, llm=llm, config=config, llm_pool=llm_pool,
+                        project_root=project_root)
     task_dispatcher = TaskDispatcher(main_loop=main_loop)
 
     @asynccontextmanager

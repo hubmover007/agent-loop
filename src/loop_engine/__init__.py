@@ -336,6 +336,20 @@ class AgentLoop:
         self._verify_config: dict | None = None  # P2.5: Per-step verification config
         self._last_eval_reason: str = ""  # P2: Latest eval reason for replan feedback
 
+    @property
+    def ammo_box(self):
+        """Access the AmmoBox from the refiller (if attached)."""
+        if self.ammo_refiller:
+            return self.ammo_refiller.ammo
+        return None
+
+    def get_ammo_context(self) -> str:
+        """Get ammo box context string for LLM injection."""
+        box = self.ammo_box
+        if box:
+            return box.to_context()
+        return ""
+
     def _get_llm(self, capabilities: list[str], strategy: str) -> LLMProvider:
         """Get the best LLM for a given capability+strategy, falling back to default."""
         if self.llm_pool:
@@ -655,6 +669,20 @@ class AgentLoop:
 
                     step_num += 1
 
+                    # ── Write step result to ammo workspace ──
+                    box = self.ammo_box
+                    if box and steps:
+                        last_step = steps[-1]
+                        step_summary = f"[step {step_num - 1}] {last_step.action}"
+                        if last_step.tool_name:
+                            step_summary += f" ({last_step.tool_name})"
+                        if last_step.error:
+                            step_summary += f" → ERROR: {last_step.error[:100]}"
+                        elif last_step.output:
+                            out = last_step.output if isinstance(last_step.output, str) else str(last_step.output)
+                            step_summary += f" → {out[:100]}"
+                        box.add_workspace(step_summary, step_num=step_num - 1)
+
                     # ── Ammo refill after each EXECUTE step ────────
                     if self.ammo_refiller:
                         try:
@@ -894,11 +922,15 @@ class AgentLoop:
 
     async def _plan(self, task_scope: str, context: dict) -> list[dict]:
         """Generate an execution plan for the task."""
+        # Inject ammo context if available
+        ammo_ctx = self.get_ammo_context()
+        ammo_section = f"\n\n--- Ammo Context ---\n{ammo_ctx}" if ammo_ctx else ""
+
         prompt = f"""You are an execution planner. Given the task and context, produce a step-by-step plan.
 
 Task: {task_scope}
 
-Context: {context}"""
+Context: {context}{ammo_section}"""
 
         # P2: Include replan feedback if a previous plan failed
         if self._replan_context:
