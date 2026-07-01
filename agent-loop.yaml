@@ -1,6 +1,6 @@
 # Agent-Loop Configuration
 memory:
-  url: "surrealdb://localhost:8000"
+  url: "surrealdb://localhost:8001"
   namespace: "agent_loop"
   database: "main"
 

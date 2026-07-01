@@ -15,10 +15,9 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from surrealdb import Surreal
-
 from ..core import MemoryLayer
+
+_Surreal: Any = None  # lazily resolved in connect()
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +51,7 @@ class MemoryPool:
         self.namespace = namespace
         self.database = database
         self._auth = {"user": user, "pass": password}
-        self._db: Surreal | None = None
+        self._db: Any = None  # surrealdb.Surreal instance
         self._embedding_fn: Any = None  # Set via configure_embedding()
         self._mem: dict[str, list[dict]] = {}  # in-memory fallback
         self._db_path: str | None = db_path
@@ -60,9 +59,20 @@ class MemoryPool:
         if db_path:
             self._init_sqlite(db_path)
 
+    @staticmethod
+    async def _get_surreal() -> Any:
+        """Lazily import AsyncSurreal; raises ImportError if not installed."""
+        global _Surreal
+        if _Surreal is None:
+            from surrealdb import AsyncSurreal as _S
+            _Surreal = _S
+        return _Surreal
+
     async def connect(self) -> None:
         """Connect to SurrealDB and initialize schema."""
-        self._db = Surreal(self.url)
+        Surreal_cls = await self._get_surreal()
+        self._db = Surreal_cls(self.url)
+        await self._db.connect()
         await self._db.signin(self._auth)
         await self._db.use(self.namespace, self.database)
         logger.info("MemoryPool connected to %s", self.url)
@@ -325,31 +335,72 @@ class MemoryPool:
             self._sqlite.commit()
 
     async def write_fact(self, fact_type: str, name: str, value: Any = None,
-                         embedding_text: str | None = None) -> str:
-        """Write a Fact (entity or facetpoint) to Layer 0."""
+                         embedding_text: str | None = None,
+                         upsert: bool = True) -> str:
+        """Write a Fact (entity or facetpoint) to Layer 0.
+
+        By default uses upsert semantics: if a fact with the same name already
+        exists, it updates the existing record instead of creating a duplicate.
+        Set upsert=False to enforce strict create-only behavior.
+        """
         embedding = await self.embed(embedding_text or name) if self._embedding_fn else None
         record = {
             "fact_type": fact_type,
             "name": name,
             "value": value,
             "embedding": embedding or [],
+            "updated_at": datetime.now(timezone.utc),
         }
         if self._db:
-            result = await self._db.create("fact", record)
-            return result["id"]
+            try:
+                result = await self._db.create("fact", record)
+            except Exception as e:
+                if upsert and "already exists" in str(e).lower():
+                    result = await self._db.query(
+                        "UPDATE fact MERGE $record WHERE name = $name RETURN AFTER",
+                        {"name": name, "record": record}
+                    )
+                    rows = result if isinstance(result, list) else result.get("result", [])
+                    if rows:
+                        row = rows[0] if isinstance(rows, list) else rows
+                        rid = row.get("id", row) if isinstance(row, dict) else row
+                        return str(rid) if rid is not None else str(row)
+                    raise RuntimeError(f"Failed to upsert fact: {name}")
+                else:
+                    raise
+            # surrealdb v2 returns RecordID; normalize to string
+            rid = result.get("id", result) if isinstance(result, dict) else result
+            return str(rid) if rid is not None else str(result)
         else:
             self._mem.setdefault("fact", []).append(record)
             return f"fact:{len(self._mem['fact'])}"
 
     async def write_facet(self, name: str, description: str) -> str:
-        """Write a Facet to Layer 1."""
+        """Write a Facet to Layer 1 (upsert: update if name already exists)."""
         embedding = await self.embed(description) if self._embedding_fn else None
-        result = await self._db.create("facet", {
+        record = {
             "name": name,
             "description": description,
             "embedding": embedding or [],
-        })
-        return result["id"]
+        }
+        try:
+            result = await self._db.create("facet", record)
+        except Exception as e:
+            if "already exists" in str(e).lower():
+                result = await self._db.query(
+                    "UPDATE facet MERGE $record WHERE name = $name RETURN AFTER",
+                    {"name": name, "record": record}
+                )
+                rows = result if isinstance(result, list) else result.get("result", [])
+                if rows:
+                    row = rows[0] if isinstance(rows, list) else rows
+                    rid = row.get("id", row) if isinstance(row, dict) else row
+                    return str(rid) if rid is not None else str(row)
+                raise RuntimeError(f"Failed to upsert facet: {name}")
+            else:
+                raise
+        rid = result.get("id", result) if isinstance(result, dict) else result
+        return str(rid) if rid is not None else str(result)
 
     async def write_episode(self, title: str, summary: str, content: str = "",
                             tags: list[str] | None = None,
@@ -373,7 +424,9 @@ class MemoryPool:
         }
         if self._db:
             result = await self._db.create("episode", record)
-            return result["id"]
+            # surrealdb v2 returns RecordID; normalize to string
+            rid = result.get("id", result) if isinstance(result, dict) else result
+            return str(rid) if rid is not None else str(result)
         else:
             self._mem.setdefault("episode", []).append(record)
             ep_id = f"episode:{len(self._mem['episode'])}"
@@ -381,25 +434,53 @@ class MemoryPool:
             return ep_id
 
     async def write_project(self, name: str, description: str) -> str:
-        """Write a Project to Layer 3."""
+        """Write a Project to Layer 3 (upsert: update if name already exists)."""
         embedding = await self.embed(description) if self._embedding_fn else None
-        result = await self._db.create("project", {
+        record = {
             "name": name,
             "description": description,
             "embedding": embedding or [],
-        })
-        return result["id"]
+        }
+        try:
+            result = await self._db.create("project", record)
+        except Exception as e:
+            if "already exists" in str(e).lower():
+                result = await self._db.query(
+                    "UPDATE project MERGE $record WHERE name = $name RETURN AFTER",
+                    {"name": name, "record": record}
+                )
+                rows = result if isinstance(result, list) else result.get("result", [])
+                if rows:
+                    row = rows[0] if isinstance(rows, list) else rows
+                    rid = row.get("id", row) if isinstance(row, dict) else row
+                    return str(rid) if rid is not None else str(row)
+                raise RuntimeError(f"Failed to upsert project: {name}")
+            else:
+                raise
+        rid = result.get("id", result) if isinstance(result, dict) else result
+        return str(rid) if rid is not None else str(result)
 
     async def write_edge(self, source: str, target: str, relation: str) -> str:
         """Write a semantic edge between two nodes."""
         embedding = await self.embed(relation) if self._embedding_fn else None
+        # Parse source/target table names from RecordID strings like "fact:xxx"
+        src_type = source.split(":")[0] if ":" in source else "unknown"
+        tgt_type = target.split(":")[0] if ":" in target else "unknown"
+        # Convert string IDs to RecordID objects (required by surrealdb v2.0)
+        from surrealdb import RecordID
+        src_rid = RecordID.parse(source) if isinstance(source, str) else source
+        tgt_rid = RecordID.parse(target) if isinstance(target, str) else target
         result = await self._db.create("edge", {
-            "source_id": source,
-            "target_id": target,
+            "source_type": src_type,
+            "source_id": src_rid,
+            "target_type": tgt_type,
+            "target_id": tgt_rid,
             "relation": relation,
             "embedding": embedding or [],
         })
-        return result["id"]
+        # surrealdb v2 returns RecordID; normalize to string
+        rid = result.get("id", result) if isinstance(result, dict) else result
+        return str(rid) if rid is not None else str(result)
 
     # ============================================================
     # Read Operations
@@ -432,7 +513,11 @@ class MemoryPool:
     async def get_episode(self, episode_id: str) -> dict | None:
         """Get an Episode by ID."""
         if self._db:
-            return await self._db.select(episode_id)
+            result = await self._db.select(episode_id)
+            # surrealdb v2.0 returns list; unwrap first element
+            if isinstance(result, list):
+                return result[0] if result else None
+            return result
         else:
             for r in self._mem.get("episode", []):
                 if r.get("id") == episode_id:
@@ -529,10 +614,19 @@ class MemoryPool:
     # ============================================================
 
     async def register_agent(self, agent_id: str, expert_profile: dict | None = None) -> None:
-        """Register an agent in the system."""
+        """Register an agent in the system (idempotent — upserts if already registered)."""
         entry = {"agent_id": agent_id, "status": "idle", "expert_profile": expert_profile}
         if self._db:
-            await self._db.create("agent_registry", entry)
+            try:
+                await self._db.create("agent_registry", entry)
+            except Exception as e:
+                if "already exists" in str(e).lower():
+                    await self._db.query(
+                        "UPDATE agent_registry MERGE $entry WHERE agent_id = $agent_id",
+                        {"agent_id": agent_id, "entry": entry}
+                    )
+                else:
+                    raise
         else:
             registry = self._mem.setdefault("agent_registry", [])
             registry.append(entry)
@@ -551,11 +645,20 @@ class MemoryPool:
 
     async def register_task(self, task_id: str, parent_id: str | None, scope: str,
                             priority: int = 3) -> None:
-        """Register a task in the system."""
+        """Register a task in the system (idempotent — upserts if already registered)."""
         entry = {"task_id": task_id, "parent_id": parent_id, "scope": scope,
                  "status": "pending", "priority": priority}
         if self._db:
-            await self._db.create("task_registry", entry)
+            try:
+                await self._db.create("task_registry", entry)
+            except Exception as e:
+                if "already exists" in str(e).lower():
+                    await self._db.query(
+                        "UPDATE task_registry MERGE $entry WHERE task_id = $task_id",
+                        {"task_id": task_id, "entry": entry}
+                    )
+                else:
+                    raise
         else:
             registry = self._mem.setdefault("task_registry", [])
             registry.append(entry)
@@ -589,7 +692,6 @@ class MemoryPool:
             "reason": reason,
             "result": result,
             "agent_log": agent_log or [],
-            "discarded_at": datetime.now(timezone.utc).isoformat(),
         }
         if self._db:
             await self._db.create("discard_pool", entry)
