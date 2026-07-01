@@ -59,7 +59,7 @@ async def test_mock_batch():
 @pytest.mark.asyncio
 async def test_mock_dimensions():
     """Provider respects configured dimensions."""
-    for dim in [64, 128, 256, 1536]:
+    for dim in [64, 128, 256, 768]:
         provider = MockEmbeddingProvider(dimensions=dim)
         assert provider.dimensions == dim
         v = await provider.embed("test")
@@ -74,7 +74,7 @@ def test_config_defaults():
     """Default config uses mock provider."""
     cfg = EmbeddingConfig()
     assert cfg.provider == "mock"
-    assert cfg.dimensions == 1536
+    assert cfg.dimensions == 768
     assert cfg.batch_size == 100
     assert cfg.cache_enabled is True
 
@@ -179,8 +179,11 @@ async def test_service_unknown_provider_fallback():
 
 
 @pytest.mark.asyncio
-async def test_service_openai_fallback_no_key():
+async def test_service_openai_fallback_no_key(monkeypatch):
     """OpenAI provider with no key falls back to mock."""
+    # Ensure no env keys leak into this test
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("EASYROUTER_API_KEY", raising=False)
     cfg = EmbeddingConfig(provider="openai", dimensions=128, api_key="")
     service = EmbeddingService(cfg)
     v = await service.embed("test")
@@ -193,7 +196,7 @@ async def test_service_default_config():
     """EmbeddingService with default config works."""
     service = EmbeddingService()
     v = await service.embed("any text")
-    assert len(v) == 1536  # default dimension
+    assert len(v) == 768  # default dimension
 
 
 # ────────────────────────────────────────────────────────────
@@ -295,7 +298,7 @@ async def test_memorypool_embed_no_config():
     """MemoryPool without embedding config returns zero vector."""
     pool = MemoryPool(db_path=":memory:")
     v = await pool.embed("hello")
-    assert v == [0.0] * 1536
+    assert v == [0.0] * 768
 
 
 @pytest.mark.asyncio
@@ -314,7 +317,7 @@ async def test_memorypool_embed_batch_no_config():
     """MemoryPool.embed_batch() without config returns zero vectors."""
     pool = MemoryPool(db_path=":memory:")
     results = await pool.embed_batch(["a", "b"])
-    assert results == [[0.0] * 1536, [0.0] * 1536]
+    assert results == [[0.0] * 768, [0.0] * 768]
 
 
 @pytest.mark.asyncio

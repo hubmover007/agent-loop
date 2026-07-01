@@ -43,6 +43,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import DEFAULT_EMBEDDING_DIM
+
 logger = logging.getLogger(__name__)
 
 
@@ -180,7 +182,7 @@ class UnifiedRetriever:
             return embeddings[0] if isinstance(embeddings, list) and embeddings else embeddings
         except Exception:
             # Fallback: return zero vector
-            return [0.0] * 1536
+            return [0.0] * DEFAULT_EMBEDDING_DIM
 
     @staticmethod
     def _format_graph_context(graph_results: list[dict]) -> str:

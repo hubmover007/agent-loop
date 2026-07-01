@@ -1,18 +1,18 @@
 """Embedding service for memory vectorization.
 
 Supports multiple providers:
-  1. OpenAI text-embedding-004 (default, 1536 dims)
-  2. OpenAI text-embedding-3-large (3072 dims)
-  3. Local sentence-transformers (bge-large-zh, 1024 dims)
-  4. Mock embedding (for testing, deterministic random vectors)
+  1. OpenAI-compatible (e.g. text-embedding-004, 768 dims)
+  2. Local sentence-transformers (bge-large-zh, 1024 dims)
+  3. Mock embedding (for testing, deterministic random vectors)
 
 Configured via agent-loop.yaml:
   memory:
     embedding:
       provider: "openai"  # or "local" or "mock"
       model: "text-embedding-004"
-      api_key: "${OPENAI_API_KEY}"
-      dimensions: 1536
+      api_key: "${OPENAI_API_KEY}"  # or EASYROUTER_API_KEY
+      base_url: "https://easyrouter.io/v1"  # optional, defaults to OpenAI
+      dimensions: 768
       batch_size: 100
 """
 
@@ -31,8 +31,9 @@ logger = logging.getLogger(__name__)
 class EmbeddingConfig:
     """Embedding service configuration."""
     provider: str = "mock"  # mock | openai | local
-    model: str = "text-embedding-004"
+    model: str = "text-embedding-004"  # 768 dims
     api_key: str = ""
+    base_url: str = ""  # empty = use OpenAI default
     dimensions: int = 768
     batch_size: int = 100
     cache_enabled: bool = True
@@ -85,14 +86,20 @@ class MockEmbeddingProvider(EmbeddingProvider):
 
 
 class OpenAIEmbeddingProvider(EmbeddingProvider):
-    """OpenAI text-embedding API provider."""
+    """OpenAI-compatible text-embedding API provider.
+
+    Supports OpenAI, EasyRouter, and other OpenAI-compatible APIs.
+    """
 
     def __init__(self, api_key: str, model: str = "text-embedding-004",
-                 dimensions: int = 768, batch_size: int = 100):
+                 dimensions: int = 768, batch_size: int = 100,
+                 base_url: str = ""):
         self._api_key = api_key
         self._model = model
         self._dimensions = dimensions
         self._batch_size = batch_size
+        # Ensure base_url doesn't double-suffix /v1
+        self._base_url = base_url.rstrip("/") if base_url else "https://api.openai.com/v1"
         self._client = None  # lazy init
 
     @property
@@ -103,7 +110,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         if self._client is None:
             import httpx
             self._client = httpx.AsyncClient(
-                base_url="https://api.openai.com/v1",
+                base_url=self._base_url,
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 timeout=30.0,
             )
@@ -194,7 +201,7 @@ class EmbeddingService:
             return MockEmbeddingProvider(self.config.dimensions)
 
         elif provider == "openai":
-            api_key = self.config.api_key or os.environ.get("OPENAI_API_KEY", "")
+            api_key = self.config.api_key or os.environ.get("OPENAI_API_KEY", "") or os.environ.get("EASYROUTER_API_KEY", "")
             if not api_key:
                 logger.warning("OpenAI embedding: no API key, falling back to mock")
                 return MockEmbeddingProvider(self.config.dimensions)
@@ -203,6 +210,7 @@ class EmbeddingService:
                 model=self.config.model,
                 dimensions=self.config.dimensions,
                 batch_size=self.config.batch_size,
+                base_url=self.config.base_url,
             )
 
         elif provider == "local":

@@ -53,6 +53,11 @@ class LoopConfig:
     tool_max_retries: int = 3           # Max tool retry attempts
     tool_retry_backoff_base: float = 2.0  # Exponential backoff base
 
+    # LLM retry & timeout
+    llm_timeout: float = 30.0           # 单次 LLM 调用超时（秒）
+    llm_max_retries: int = 3            # LLM 调用重试次数
+    llm_retry_backoff_base: float = 2.0 # 指数退避基数
+
     # Evaluator
     accept_threshold: float = 0.7       # Accept agent result if score >= this
     evaluation_weights: dict[str, float] = field(default_factory=lambda: {
@@ -122,6 +127,43 @@ class LLMProvider(ABC):
             tool_choice: "auto" | "none" | "required" | specific dict
         """
         ...
+
+    async def chat_with_retry(self, messages: list[dict], **kwargs) -> LLMResponse:
+        """带重试的 chat 调用：指数退避，可配置超时。
+
+        从 kwargs 中提取重试参数（不影响传递给 chat 的参数）：
+          - max_retries: 最大重试次数（默认 3）
+          - timeout: 单次调用超时秒数（默认 30.0）
+        """
+        max_retries = kwargs.pop("max_retries", 3)
+        timeout = kwargs.pop("timeout", 30.0)
+
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                return await asyncio.wait_for(
+                    self.chat(messages, **kwargs),
+                    timeout=timeout,
+                )
+            except asyncio.TimeoutError as e:
+                last_error = e
+                logger.warning(
+                    "LLM attempt %d/%d timed out after %.1fs",
+                    attempt + 1, max_retries, timeout,
+                )
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    "LLM attempt %d/%d failed: %s",
+                    attempt + 1, max_retries, type(e).__name__,
+                )
+
+            if attempt < max_retries - 1:
+                delay = 2 ** attempt
+                logger.info("Retrying in %.1fs...", delay)
+                await asyncio.sleep(delay)
+
+        raise last_error  # type: ignore[misc]
 
     async def chat_stream(self, messages: list[dict],
                           tools: list[dict] | None = None) -> AsyncGenerator:

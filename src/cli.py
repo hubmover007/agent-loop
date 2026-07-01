@@ -608,11 +608,11 @@ def cmd_setup(args):
     # ── 3. Embedding ──
     print("\n📋 3. Embedding 配置")
     print("  mock: 测试用，不需要 API（推荐初次使用）")
-    print("  openai: 用 OpenAI text-embedding-3-small")
+    print("  openai: 用 OpenAI-compatible text-embedding-004")
     print("  local: 本地 sentence-transformers")
 
     emb_provider = input("选择 embedding [mock/openai/local] (默认 mock): ").strip() or "mock"
-    emb_config = {"provider": emb_provider, "dimensions": 1536}
+    emb_config = {"provider": emb_provider, "dimensions": 768}
 
     if emb_provider == "openai":
         emb_key = input("OpenAI API Key (可复用上面的): ").strip() or config.get("api_key", "")

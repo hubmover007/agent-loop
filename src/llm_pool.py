@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import time
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -507,6 +508,33 @@ class PoolManagedProvider(LLMProvider):
         return [item.embedding for item in response.data]
 
 
+# ── Token cost rates (per 1K tokens) ──
+_TOKEN_COST_PER_1K: dict[str, dict[str, float]] = {
+    "deepseek-v4-pro": {"input": 0.001, "output": 0.002},
+    "deepseek-v4-flash": {"input": 0.0005, "output": 0.0015},
+    "gpt-5.5": {"input": 0.005, "output": 0.015},
+    "gemini-2.5-flash": {"input": 0.0005, "output": 0.0015},
+    "gemini-2.5-pro": {"input": 0.003, "output": 0.012},
+    "deepseek-chat": {"input": 0.001, "output": 0.002},
+    "deepseek-reasoner": {"input": 0.001, "output": 0.004},
+    "glm-5-turbo": {"input": 0.0005, "output": 0.001},
+    "glm-5.1": {"input": 0.0005, "output": 0.001},
+    "glm-5.2": {"input": 0.0005, "output": 0.001},
+    "kimi-k2.6": {"input": 0.001, "output": 0.003},
+    "gpt-4o": {"input": 0.0025, "output": 0.01},
+    "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
+}
+
+
+def _calc_token_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    """计算 LLM 调用的 token 成本（美元）。"""
+    rates = _TOKEN_COST_PER_1K.get(
+        model,
+        _TOKEN_COST_PER_1K.get("deepseek-v4-pro", {"input": 0.001, "output": 0.002}),
+    )
+    return (prompt_tokens / 1000 * rates["input"]) + (completion_tokens / 1000 * rates["output"])
+
+
 # ============================================================
 # LLMPool — main entry point
 # ============================================================
@@ -530,6 +558,17 @@ class LLMPool:
         )
         self._cost_controller = cost_controller
         self._initialized = False
+
+        # ── Token 用量统计 ──
+        self._usage_stats: dict[str, Any] = {
+            "total_tokens": 0,
+            "total_prompt_tokens": 0,
+            "total_completion_tokens": 0,
+            "total_cost": 0.0,
+            "total_calls": 0,
+            "by_provider": defaultdict(lambda: {"tokens": 0, "calls": 0, "cost": 0.0}),
+            "by_model": defaultdict(lambda: {"tokens": 0, "calls": 0, "cost": 0.0}),
+        }
 
     def initialize(self) -> None:
         """Load config and instantiate all enabled providers (sync)."""
@@ -909,3 +948,42 @@ class LLMPool:
     def usage_stats(self) -> dict:
         """Return usage statistics for all providers."""
         return self._tracker.get_stats()
+
+    # ── Token 用量统计 ────────────────────────────────────────────
+
+    def _record_token_usage(self, provider_id: str, model: str,
+                            prompt_tokens: int, completion_tokens: int) -> None:
+        """记录一次 LLM 调用的 token 用量。"""
+        total = prompt_tokens + completion_tokens
+        cost = _calc_token_cost(model, prompt_tokens, completion_tokens)
+
+        self._usage_stats["total_tokens"] += total
+        self._usage_stats["total_prompt_tokens"] += prompt_tokens
+        self._usage_stats["total_completion_tokens"] += completion_tokens
+        self._usage_stats["total_cost"] += cost
+        self._usage_stats["total_calls"] += 1
+
+        self._usage_stats["by_provider"][provider_id]["tokens"] += total
+        self._usage_stats["by_provider"][provider_id]["calls"] += 1
+        self._usage_stats["by_provider"][provider_id]["cost"] += cost
+
+        self._usage_stats["by_model"][model]["tokens"] += total
+        self._usage_stats["by_model"][model]["calls"] += 1
+        self._usage_stats["by_model"][model]["cost"] += cost
+
+    def get_token_usage(self) -> dict:
+        """获取 token 用量统计快照。"""
+        result: dict[str, Any] = {
+            "total_tokens": self._usage_stats["total_tokens"],
+            "total_prompt_tokens": self._usage_stats["total_prompt_tokens"],
+            "total_completion_tokens": self._usage_stats["total_completion_tokens"],
+            "total_cost": round(self._usage_stats["total_cost"], 6),
+            "total_calls": self._usage_stats["total_calls"],
+        }
+        result["by_provider"] = {
+            k: dict(v) for k, v in self._usage_stats["by_provider"].items()
+        }
+        result["by_model"] = {
+            k: dict(v) for k, v in self._usage_stats["by_model"].items()
+        }
+        return result

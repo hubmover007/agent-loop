@@ -5,8 +5,9 @@ memory:
   database: "main"
   embedding:
     provider: "mock"  # mock | openai | local
-    model: "text-embedding-3-small"
-    api_key: "${OPENAI_API_KEY}"
+    model: "text-embedding-004"
+    api_key: "${EASYROUTER_API_KEY}"
+    base_url: "https://easyrouter.io/v1"
     dimensions: 768
     batch_size: 100
     cache_enabled: true

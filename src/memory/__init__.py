@@ -401,13 +401,13 @@ class MemoryPool:
             agent_id: Namespace isolation key (defaults to "shared" for
                       backward compatibility).
         """
-        embedding = await self.embed(embedding_text or name) if (self._embedding_service or self._embedding_fn) else None
+        embedding = await self.embed(embedding_text or name)
         record = {
             "fact_type": fact_type,
             "name": name,
             "value": value,
             "agent_id": agent_id,
-            "embedding": embedding or [],
+            "embedding": embedding,
             "type": mem_type,
             "summary": summary or name,
             "trigger": trigger,
@@ -452,11 +452,11 @@ class MemoryPool:
 
     async def write_facet(self, name: str, description: str) -> str:
         """Write a Facet to Layer 1 (upsert: update if name already exists)."""
-        embedding = await self.embed(description) if (self._embedding_service or self._embedding_fn) else None
+        embedding = await self.embed(description)
         record = {
             "name": name,
             "description": description,
-            "embedding": embedding or [],
+            "embedding": embedding,
         }
         try:
             result = await self._db.create("facet", record)
@@ -495,12 +495,12 @@ class MemoryPool:
                             steps: list[str] | None = None,
                             related_ids: list[str] | None = None) -> str:
         """Write an Episode to Layer 2."""
-        embedding = await self.embed(summary) if (self._embedding_service or self._embedding_fn) else None
+        embedding = await self.embed(summary)
         record = {
             "title": title,
             "summary": summary,
             "content": content,
-            "embedding": embedding or [],
+            "embedding": embedding,
             "tags": tags or [],
             "type": mem_type,
             "user_input": user_input,
@@ -532,11 +532,11 @@ class MemoryPool:
 
     async def write_project(self, name: str, description: str) -> str:
         """Write a Project to Layer 3 (upsert: update if name already exists)."""
-        embedding = await self.embed(description) if (self._embedding_service or self._embedding_fn) else None
+        embedding = await self.embed(description)
         record = {
             "name": name,
             "description": description,
-            "embedding": embedding or [],
+            "embedding": embedding,
         }
         try:
             result = await self._db.create("project", record)
@@ -559,7 +559,7 @@ class MemoryPool:
 
     async def write_edge(self, source: str, target: str, relation: str) -> str:
         """Write a semantic edge between two nodes."""
-        embedding = await self.embed(relation) if (self._embedding_service or self._embedding_fn) else None
+        embedding = await self.embed(relation)
         # Parse source/target table names from RecordID strings like "fact:xxx"
         src_type = source.split(":")[0] if ":" in source else "unknown"
         tgt_type = target.split(":")[0] if ":" in target else "unknown"
@@ -573,7 +573,7 @@ class MemoryPool:
             "target_type": tgt_type,
             "target_id": tgt_rid,
             "relation": relation,
-            "embedding": embedding or [],
+            "embedding": embedding,
         })
         # surrealdb v2 returns RecordID; normalize to string
         rid = result.get("id", result) if isinstance(result, dict) else result
