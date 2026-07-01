@@ -19,6 +19,23 @@ DEFINE FIELD embedding ON fact TYPE array<float>;
 DEFINE FIELD created_at ON fact TYPE datetime DEFAULT time::now();
 DEFINE FIELD updated_at ON fact TYPE datetime DEFAULT time::now();
 
+-- Unified schema fields (non-breaking additions)
+DEFINE FIELD type ON fact TYPE string DEFAULT "fact";
+DEFINE FIELD summary ON fact TYPE string DEFAULT "";
+DEFINE FIELD trigger ON fact TYPE string DEFAULT "";
+DEFINE FIELD action ON fact TYPE string DEFAULT "";
+DEFINE FIELD outcome ON fact TYPE string DEFAULT "";
+DEFINE FIELD lesson ON fact TYPE string DEFAULT "";
+DEFINE FIELD confidence ON fact TYPE float DEFAULT 0.5;
+DEFINE FIELD related_ids ON fact TYPE array DEFAULT [];
+DEFINE FIELD related_type ON fact TYPE string DEFAULT "";
+DEFINE FIELD context ON fact TYPE option;
+DEFINE FIELD steps ON fact TYPE array DEFAULT [];
+DEFINE FIELD error ON fact TYPE string DEFAULT "";
+DEFINE FIELD fix ON fact TYPE string DEFAULT "";
+DEFINE FIELD tags ON fact TYPE array DEFAULT [];
+DEFINE FIELD access_count ON fact TYPE int DEFAULT 0;
+
 -- Composite unique: same (fact_type, name) only unique per agent namespace
 DEFINE INDEX idx_fact_name ON fact FIELDS fact_type, name, agent_id UNIQUE;
 DEFINE INDEX idx_fact_type ON fact FIELDS fact_type;
@@ -59,6 +76,20 @@ DEFINE FIELD consolidated ON episode TYPE bool DEFAULT false;
 DEFINE FIELD created_at ON episode TYPE datetime DEFAULT time::now();
 DEFINE FIELD updated_at ON episode TYPE datetime DEFAULT time::now();
 
+-- Unified schema fields (non-breaking additions; type/summary/tags already exist)
+DEFINE FIELD project ON episode TYPE string DEFAULT "";
+DEFINE FIELD trigger ON episode TYPE string DEFAULT "";
+DEFINE FIELD action ON episode TYPE string DEFAULT "";
+DEFINE FIELD outcome ON episode TYPE string DEFAULT "";
+DEFINE FIELD lesson ON episode TYPE string DEFAULT "";
+DEFINE FIELD confidence ON episode TYPE float DEFAULT 0.5;
+DEFINE FIELD related_ids ON episode TYPE array DEFAULT [];
+DEFINE FIELD related_type ON episode TYPE string DEFAULT "";
+DEFINE FIELD steps ON episode TYPE array DEFAULT [];
+DEFINE FIELD error ON episode TYPE string DEFAULT "";
+DEFINE FIELD fix ON episode TYPE string DEFAULT "";
+DEFINE FIELD access_count ON episode TYPE int DEFAULT 0;
+
 DEFINE INDEX idx_episode_title ON episode FIELDS title;
 DEFINE INDEX idx_episode_mtree ON episode FIELDS embedding MTREE DIMENSION 1536 DISTANCE COSINE TYPE F64;
 DEFINE INDEX idx_episode_ft ON episode FIELDS summary SEARCH ANALYZER simple BM25;
@@ -73,6 +104,11 @@ DEFINE FIELD description ON project TYPE string;
 DEFINE FIELD embedding ON project TYPE array<float>;
 DEFINE FIELD created_at ON project TYPE datetime DEFAULT time::now();
 DEFINE FIELD updated_at ON project TYPE datetime DEFAULT time::now();
+
+-- Unified schema fields (non-breaking additions)
+DEFINE FIELD type ON project TYPE string DEFAULT "project";
+DEFINE FIELD confidence ON project TYPE float DEFAULT 0.5;
+DEFINE FIELD tags ON project TYPE array DEFAULT [];
 
 DEFINE INDEX idx_project_name ON project FIELDS name UNIQUE;
 DEFINE INDEX idx_project_mtree ON project FIELDS embedding MTREE DIMENSION 1536 DISTANCE COSINE TYPE F64;

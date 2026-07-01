@@ -350,6 +350,75 @@ def cmd_stats(args):
     asyncio.run(run())
 
 
+def cmd_anchor_list(args):
+    """List all anchor files."""
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+
+    from src.memory.anchor import AnchorManager
+    mgr = AnchorManager(args.anchor_dir)
+    names = mgr.list_anchors()
+
+    if not names:
+        print("No anchor files found.")
+        return
+
+    print(f"Anchor files ({len(names)}):")
+    for name in names:
+        anchor = mgr.read_anchor(name)
+        entry_count = len(anchor.entries) if anchor else 0
+        print(f"  {name}.md — {entry_count} entries")
+
+
+def cmd_anchor_show(args):
+    """Show contents of an anchor file."""
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+
+    from src.memory.anchor import AnchorManager
+    mgr = AnchorManager(args.anchor_dir)
+    anchor = mgr.read_anchor(args.name)
+
+    if not anchor:
+        print(f"Anchor '{args.name}' not found.")
+        sys.exit(1)
+
+    print(anchor.to_markdown())
+
+
+def cmd_anchor_sync(args):
+    """Sync anchor files to SurrealDB fact table."""
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+
+    async def run():
+        from src.memory import MemoryPool
+        from src.memory.anchor import AnchorManager
+
+        memory = MemoryPool(args.memory_url)
+        await memory.connect()
+
+        mgr = AnchorManager(args.anchor_dir, memory_pool=memory)
+        count = await mgr.sync_to_db(name=args.name or None)
+        print(f"Synced {count} anchor facts to DB.")
+
+        await memory.disconnect()
+
+    asyncio.run(run())
+
+
+def cmd_anchor_lookup(args):
+    """Look up a specific key in an anchor file."""
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+
+    from src.memory.anchor import AnchorManager
+    mgr = AnchorManager(args.anchor_dir)
+    value = mgr.lookup(args.name, args.key)
+
+    if value is None:
+        print(f"Key '{args.key}' not found in anchor '{args.name}'.")
+        sys.exit(1)
+
+    print(f"{args.name}.{args.key} = {value}")
+
+
 def cmd_cleanup(args):
     """Clean up stale episodes from memory."""
     sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -421,6 +490,31 @@ def main():
     p_stats = sub.add_parser("stats", help="Show memory pool stats")
     p_stats.add_argument("--memory-url", default="surrealdb://localhost:8000")
     p_stats.set_defaults(func=cmd_stats)
+
+    # anchor
+    p_anchor = sub.add_parser("anchor", help="Manage anchor files")
+    p_anchor_sub = p_anchor.add_subparsers(dest="anchor_command")
+
+    p_anchor_list = p_anchor_sub.add_parser("list", help="List all anchor files")
+    p_anchor_list.add_argument("--anchor-dir", default="state/anchors")
+    p_anchor_list.set_defaults(func=cmd_anchor_list)
+
+    p_anchor_show = p_anchor_sub.add_parser("show", help="Show anchor file contents")
+    p_anchor_show.add_argument("name", help="Anchor name (without .md)")
+    p_anchor_show.add_argument("--anchor-dir", default="state/anchors")
+    p_anchor_show.set_defaults(func=cmd_anchor_show)
+
+    p_anchor_sync = p_anchor_sub.add_parser("sync", help="Sync anchors to SurrealDB")
+    p_anchor_sync.add_argument("--name", default=None, help="Specific anchor to sync (default: all)")
+    p_anchor_sync.add_argument("--anchor-dir", default="state/anchors")
+    p_anchor_sync.add_argument("--memory-url", default="surrealdb://localhost:8000")
+    p_anchor_sync.set_defaults(func=cmd_anchor_sync)
+
+    p_anchor_lookup = p_anchor_sub.add_parser("lookup", help="Look up a key in an anchor")
+    p_anchor_lookup.add_argument("name", help="Anchor name (without .md)")
+    p_anchor_lookup.add_argument("key", help="Key to look up")
+    p_anchor_lookup.add_argument("--anchor-dir", default="state/anchors")
+    p_anchor_lookup.set_defaults(func=cmd_anchor_lookup)
 
     # cleanup
     p_cleanup = sub.add_parser("cleanup", help="Clean up stale episodes from memory")

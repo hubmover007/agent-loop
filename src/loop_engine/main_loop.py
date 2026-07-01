@@ -27,12 +27,14 @@ class MainLoop:
     def __init__(self, memory: MemoryPool, llm: LLMProvider,
                  config: LoopConfig | None = None,
                  state_store: Any | None = None,
-                 tracer: Any | None = None):
+                 tracer: Any | None = None,
+                 anchor_manager: Any | None = None):
         self.memory = memory
         self.llm = llm
         self.config = config or LoopConfig()
         self.state_store = state_store
         self.tracer = tracer  # Optional Tracer for distributed tracing
+        self.anchor_manager = anchor_manager  # Optional AnchorManager for O(1) key-fact lookup
 
         # Sub-systems
         from ..tools.base import ToolRegistry
@@ -76,15 +78,61 @@ class MainLoop:
     # 2. RETRIEVE
     # ============================================================
 
+    def _check_anchors(self, query: str) -> dict[str, str] | None:
+        """Check if query matches any anchor key.
+
+        Simple heuristic: if query contains an anchor name or any entry key,
+        return the matching anchor file contents keyed by anchor name.
+        """
+        if not self.anchor_manager:
+            return None
+
+        query_lower = query.lower()
+        hits: dict[str, str] = {}
+
+        for name in self.anchor_manager.list_anchors():
+            anchor = self.anchor_manager.read_anchor(name)
+            if not anchor:
+                continue
+
+            # Check if query mentions the anchor name
+            name_match = (
+                name.replace("-", "_") in query_lower
+                or name.replace("_", "-") in query_lower
+                or name.replace("-", " ") in query_lower
+            )
+
+            # Check if query mentions any entry key
+            key_match = any(
+                e.key.lower() in query_lower or e.value.lower() in query_lower
+                for e in anchor.entries
+            )
+
+            if name_match or key_match:
+                hits[name] = anchor.to_markdown()
+
+        return hits if hits else None
+
     async def _retrieve(self, ctx: LoopContext) -> None:
         """Retrieve unified memory context: M-FLOW graph + Mythos deep recall.
 
         This is the systemic integration point:
-          1. GraphRouter queries explicit knowledge graph (M-FLOW)
-          2. Results feed into DeepReason for implicit recall (Mythos)
-          3. Unified MemoryContext returned with both layers
+          1. Anchor layer: O(1) precise lookup for stable key facts
+          2. GraphRouter queries explicit knowledge graph (M-FLOW)
+          3. Results feed into DeepReason for implicit recall (Mythos)
+          4. Unified MemoryContext returned with both layers
         """
         ctx.current_phase = LoopPhase.RETRIEVE
+
+        # Step 0: Check anchor layer (precise O(1) lookup for stable key facts)
+        if self.anchor_manager:
+            anchor_hits = self._check_anchors(ctx.user_input)
+            if anchor_hits:
+                ctx.anchor_context = anchor_hits
+                logger.info(
+                    "MainLoop[%s]: RETRIEVE anchor hit → %s",
+                    ctx.session_id, list(anchor_hits.keys()),
+                )
 
         try:
             # Unified retrieval: explicit graph + implicit deep reasoning

@@ -376,7 +376,20 @@ class MemoryPool:
     async def write_fact(self, fact_type: str, name: str, value: Any = None,
                          embedding_text: str | None = None,
                          upsert: bool = True,
-                         agent_id: str = "shared") -> str:
+                         agent_id: str = "shared",
+                         # Unified schema fields
+                         mem_type: str = "fact",
+                         summary: str | None = None,
+                         trigger: str = "",
+                         action: str = "",
+                         outcome: str = "",
+                         lesson: str = "",
+                         confidence: float = 0.5,
+                         tags: list[str] | None = None,
+                         error: str = "",
+                         fix: str = "",
+                         steps: list[str] | None = None,
+                         related_ids: list[str] | None = None) -> str:
         """Write a Fact (entity or facetpoint) to Layer 0.
 
         By default uses upsert semantics: if a fact with the same (fact_type,
@@ -395,6 +408,18 @@ class MemoryPool:
             "value": value,
             "agent_id": agent_id,
             "embedding": embedding or [],
+            "type": mem_type,
+            "summary": summary or name,
+            "trigger": trigger,
+            "action": action,
+            "outcome": outcome,
+            "lesson": lesson,
+            "confidence": confidence,
+            "tags": tags or [],
+            "error": error,
+            "fix": fix,
+            "steps": steps or [],
+            "related_ids": related_ids or [],
             "updated_at": datetime.now(timezone.utc),
         }
         if self._db:
@@ -456,7 +481,19 @@ class MemoryPool:
                             tags: list[str] | None = None,
                             user_input: str = "", output: str = "",
                             task_count: int = 0, session_id: str = "",
-                            consolidated: bool = False) -> str:
+                            consolidated: bool = False,
+                            # Unified schema fields
+                            mem_type: str = "episode",
+                            project: str = "",
+                            trigger: str = "",
+                            action: str = "",
+                            outcome: str = "",
+                            lesson: str = "",
+                            confidence: float = 0.5,
+                            error: str = "",
+                            fix: str = "",
+                            steps: list[str] | None = None,
+                            related_ids: list[str] | None = None) -> str:
         """Write an Episode to Layer 2."""
         embedding = await self.embed(summary) if (self._embedding_service or self._embedding_fn) else None
         record = {
@@ -465,12 +502,22 @@ class MemoryPool:
             "content": content,
             "embedding": embedding or [],
             "tags": tags or [],
-            "type": "episode",
+            "type": mem_type,
             "user_input": user_input,
             "output": output,
             "task_count": task_count,
             "session_id": session_id,
             "consolidated": consolidated,
+            "project": project,
+            "trigger": trigger,
+            "action": action,
+            "outcome": outcome,
+            "lesson": lesson,
+            "confidence": confidence,
+            "error": error,
+            "fix": fix,
+            "steps": steps or [],
+            "related_ids": related_ids or [],
         }
         if self._db:
             result = await self._db.create("episode", record)
@@ -531,6 +578,25 @@ class MemoryPool:
         # surrealdb v2 returns RecordID; normalize to string
         rid = result.get("id", result) if isinstance(result, dict) else result
         return str(rid) if rid is not None else str(result)
+
+    # ============================================================
+    # Unified Schema Rendering
+    # ============================================================
+
+    def render_records_for_llm(self, records: list[dict],
+                                max_tokens: int = 2000) -> str:
+        """Render DB rows as LLM-friendly text using MemoryRecord.to_compact_text().
+
+        Args:
+            records: List of dict rows from SurrealDB or in-memory store.
+            max_tokens: Approximate token limit for output truncation.
+
+        Returns:
+            Compact text block suitable for LLM context windows.
+        """
+        from .schema import MemoryRecord, render_for_llm as _render
+        mem_records = [MemoryRecord.from_dict(r) for r in records]
+        return _render(mem_records, max_tokens)
 
     # ============================================================
     # Read Operations
@@ -625,6 +691,17 @@ class MemoryPool:
         """
         data_copy = dict(data)
         record_type = data_copy.pop("type", "episode")
+        # Extract unified schema fields (common to both episode and fact)
+        mem_type = data_copy.pop("mem_type", record_type)
+        trigger = data_copy.pop("trigger", "")
+        action = data_copy.pop("action", "")
+        outcome = data_copy.pop("outcome", "")
+        lesson = data_copy.pop("lesson", "")
+        confidence = data_copy.pop("confidence", 0.5)
+        error = data_copy.pop("error", "")
+        fix = data_copy.pop("fix", "")
+        steps = data_copy.pop("steps", None)
+        related_ids = data_copy.pop("related_ids", None)
         if record_type == "episode":
             return await self.write_episode(
                 title=data_copy.pop("title", data_copy.get("user_input", "")[:80]),
@@ -636,6 +713,17 @@ class MemoryPool:
                 task_count=data_copy.pop("task_count", 0),
                 session_id=data_copy.pop("session_id", ""),
                 consolidated=data_copy.pop("consolidated", False),
+                mem_type=mem_type,
+                project=data_copy.pop("project", ""),
+                trigger=trigger,
+                action=action,
+                outcome=outcome,
+                lesson=lesson,
+                confidence=confidence,
+                error=error,
+                fix=fix,
+                steps=steps,
+                related_ids=related_ids,
             )
         elif record_type == "fact":
             return await self.write_fact(
@@ -644,6 +732,18 @@ class MemoryPool:
                 value=data_copy.pop("value", None),
                 embedding_text=data_copy.pop("embedding_text", None),
                 agent_id=data_copy.pop("agent_id", "shared"),
+                mem_type=mem_type,
+                summary=data_copy.pop("summary", None),
+                trigger=trigger,
+                action=action,
+                outcome=outcome,
+                lesson=lesson,
+                confidence=confidence,
+                tags=data_copy.pop("tags", None),
+                error=error,
+                fix=fix,
+                steps=steps,
+                related_ids=related_ids,
             )
         else:
             raise ValueError(f"Unknown record type: {record_type}")
