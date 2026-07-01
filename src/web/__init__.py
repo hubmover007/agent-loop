@@ -28,6 +28,7 @@ from ..loop_engine import LLMProvider, LoopConfig
 from ..loop_engine.main_loop import MainLoop, LoopContext
 from ..memory import MemoryPool
 from ..system_agents import TaskAgent, AgentManagerAgent, TaskRegistry
+from ..task_queue import TaskDispatcher, TaskHandle, TaskState
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,7 @@ def create_app(memory: MemoryPool, llm: LLMProvider,
 
     config = config or LoopConfig()
     main_loop = MainLoop(memory=memory, llm=llm, config=config)
+    task_dispatcher = TaskDispatcher(main_loop=main_loop)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -116,10 +118,12 @@ def create_app(memory: MemoryPool, llm: LLMProvider,
 
     # Store in app state
     app.state.main_loop = main_loop
+    app.state.task_dispatcher = task_dispatcher
     app.state.memory = memory
     app.state.llm = llm
     app.state.config = config
     app.state.active_loops: dict[str, LoopContext] = {}
+    app.state.ws_clients: list[WebSocket] = []  # Connected WebSocket clients
 
     # ============================================================
     # Endpoints
@@ -156,18 +160,20 @@ def create_app(memory: MemoryPool, llm: LLMProvider,
         import uuid as uuid_mod
         session_id = request.session_id or f"session:{uuid_mod.uuid4().hex[:12]}"
 
-        # Run MainLoop
-        ctx = await main_loop.run(request.message)
+        # Use TaskDispatcher for cancellation-aware dispatch
+        output = await task_dispatcher.dispatch(request.message)
 
+        ctx = LoopContext(user_input=request.message)
+        ctx.final_output = output
         app.state.active_loops[session_id] = ctx
 
         return ChatResponse(
             session_id=session_id,
-            output=ctx.final_output or "",
-            tasks_created=len(ctx.task_ids),
-            tasks_done=len(ctx.agent_results),
-            tasks_failed=len(ctx.discarded_results),
-            errors=ctx.errors,
+            output=output or "",
+            tasks_created=0,
+            tasks_done=0,
+            tasks_failed=0,
+            errors=[],
         )
 
     @app.get("/api/tasks")

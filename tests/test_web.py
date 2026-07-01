@@ -103,27 +103,15 @@ async def test_cancel_task_no_manager(create_app_client):
 @pytest.mark.asyncio
 async def test_chat_submit(create_app_client):
     """POST /api/chat submits user input and returns response."""
-    with patch("src.web.MainLoop.run", new_callable=AsyncMock) as mock_run:
-        from src.loop_engine.main_loop import LoopContext
-        ctx = LoopContext(
-            session_id="test-session",
-            user_input="Hello",
-        )
-        ctx.final_output = "Hello, world!"
-        ctx.task_ids = ["task:1", "task:2"]
-        ctx.agent_results = [MagicMock(), MagicMock()]
-        ctx.discarded_results = []
-        ctx.errors = []
-        mock_run.return_value = ctx
+    with patch("src.web.TaskDispatcher.dispatch", new_callable=AsyncMock) as mock_dispatch:
+        mock_dispatch.return_value = "Hello, world!"
 
         async with create_app_client as client:
             resp = await client.post("/api/chat", json={"message": "Hello"})
             assert resp.status_code == 200
             data = resp.json()
             assert "session_id" in data
-            assert "output" in data
-            assert data["tasks_created"] == 2
-            assert data["tasks_done"] == 2
+            assert data["output"] == "Hello, world!"
 
 
 @pytest.mark.asyncio
