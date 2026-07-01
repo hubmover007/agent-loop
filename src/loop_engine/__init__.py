@@ -156,6 +156,9 @@ class LoopContext:
     user_input: str = ""
     current_phase: LoopPhase = LoopPhase.INPUT
 
+    # Multimodal
+    media_blocks: list[dict] = field(default_factory=list)  # ContentBlock[] from MultimodalRouter
+
     # Retrieval
     retrieved_context: list[dict] = field(default_factory=list)
 

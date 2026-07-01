@@ -349,16 +349,40 @@ class MainLoop:
     # Main Loop
     # ============================================================
 
-    async def run(self, user_input: str) -> str:
+    async def run(self, user_input: str | list[MediaInput], task_handle: Any = None) -> str:
         """Execute the complete MainLoop cycle.
 
         Args:
-            user_input: The user's message
+            user_input: The user's message (str) or a list of MediaInput objects
+            task_handle: Optional TaskHandle for cancellation/pause/resume support
 
         Returns:
             The final response text
         """
-        ctx = LoopContext(user_input=user_input)
+        # ── Multimodal routing ─────────────────────────────────
+        if isinstance(user_input, list):
+            # Multimodal input: route via MultimodalRouter
+            media_inputs: list[MediaInput] = user_input
+            text_parts = [m.source for m in media_inputs if m.type == "text"]
+            text_input = " ".join(text_parts) or "[multimodal input]"
+
+            ctx = LoopContext(user_input=text_input)
+            ctx.media_blocks = await self.multimodal_router.process(media_inputs)
+            logger.info(
+                "MainLoop[%s]: multimodal routing → %d blocks",
+                ctx.session_id, len(ctx.media_blocks),
+            )
+        else:
+            ctx = LoopContext(user_input=user_input)
+            ctx.media_blocks = []
+
+        async def _check_handle():
+            """Check task_handle at safe points during execution."""
+            if task_handle is not None:
+                await task_handle.wait_if_paused()
+                if await task_handle.check_cancelled():
+                    return True
+            return False
         logger.info("=" * 60)
         logger.info("MainLoop[%s]: START", ctx.session_id)
 
@@ -390,6 +414,13 @@ class MainLoop:
             phase_span = None
             if self.tracer:
                 phase_span = self.tracer.start_span(f"phase.{phase.__name__}")
+            # Check for cancellation/pause before each phase
+            if await _check_handle():
+                logger.info("MainLoop[%s]: cancelled during %s", ctx.session_id, phase.__name__)
+                ctx.errors.append("Task cancelled by user")
+                ctx.final_output = "任务已取消"
+                break
+
             try:
                 await phase(ctx)
                 if self.tracer and phase_span:

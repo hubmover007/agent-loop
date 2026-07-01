@@ -49,6 +49,7 @@ class ProviderConfigJSON:
     model: str = ""
     api_key_source: str = "none"  # "none" | "env:VAR_NAME"
     capabilities: list[str] = field(default_factory=list)
+    modality: list[str] = field(default_factory=lambda: ["text"])  # Supported modalities: text, image, audio, video
     cost_per_1m_input: float = 0.0
     cost_per_1m_output: float = 0.0
     max_concurrent: int = 1
@@ -66,6 +67,7 @@ class ProviderConfigJSON:
             model=data.get("model", ""),
             api_key_source=data.get("api_key_source", "none"),
             capabilities=data.get("capabilities", []),
+            modality=data.get("modality", ["text"]),
             cost_per_1m_input=data.get("cost_per_1m_input", 0.0),
             cost_per_1m_output=data.get("cost_per_1m_output", 0.0),
             max_concurrent=data.get("max_concurrent", 1),
@@ -83,6 +85,7 @@ class ProviderConfigJSON:
             "model": self.model,
             "api_key_source": self.api_key_source,
             "capabilities": self.capabilities,
+            "modality": self.modality,
             "cost_per_1m_input": self.cost_per_1m_input,
             "cost_per_1m_output": self.cost_per_1m_output,
             "max_concurrent": self.max_concurrent,
@@ -575,7 +578,8 @@ class LLMPool:
 
     def select(self, capabilities: list[str] | None = None,
                strategy: str | None = None,
-               task_type: str | None = None) -> ProviderConfigJSON | None:
+               task_type: str | None = None,
+               modalities: list[str] | None = None) -> ProviderConfigJSON | None:
         """Select the best provider config without acquiring it."""
         if not self._initialized:
             self.initialize()
@@ -592,6 +596,9 @@ class LLMPool:
                 continue
             if capabilities:
                 if not all(c in cfg.capabilities for c in capabilities):
+                    continue
+            if modalities:
+                if not all(m in cfg.modality for m in modalities):
                     continue
             cb = self._circuit_breakers.get(cfg.id)
             if cb and not cb.is_available():
@@ -632,6 +639,37 @@ class LLMPool:
             )
 
         return candidates[0] if candidates else None
+
+    # ── Modality-aware selection ───────────────────────────────────
+
+    def get_vision_model(self) -> ProviderConfigJSON | None:
+        """Get the best provider capable of image/vision processing."""
+        if not self._initialized:
+            self.initialize()
+        return self.select(
+            capabilities=["vision"],
+            modalities=["text", "image"],
+            strategy="cheapest",
+        )
+
+    def get_stt_model(self) -> ProviderConfigJSON | None:
+        """Get the best provider capable of speech-to-text / audio processing."""
+        if not self._initialized:
+            self.initialize()
+        # Try dedicated STT/audio provider first
+        cfg = self.select(
+            capabilities=["audio", "stt"],
+            modalities=["text", "audio"],
+            strategy="cheapest",
+        )
+        if cfg:
+            return cfg
+        # Fallback: any provider with audio modality
+        return self.select(
+            capabilities=["audio"],
+            modalities=["text", "audio"],
+            strategy="cheapest",
+        )
 
     async def acquire(self, capabilities: list[str] | None = None,
                       strategy: str | None = None,
