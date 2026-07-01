@@ -48,13 +48,15 @@ class MainLoop:
                  config: LoopConfig | None = None,
                  state_store: Any | None = None,
                  tracer: Any | None = None,
-                 anchor_manager: Any | None = None):
+                 anchor_manager: Any | None = None,
+                 cost_controller: Any | None = None):
         self.memory = memory
         self.llm = llm
         self.config = config or LoopConfig()
         self.state_store = state_store
         self.tracer = tracer  # Optional Tracer for distributed tracing
         self.anchor_manager = anchor_manager  # Optional AnchorManager for O(1) key-fact lookup
+        self.cost_controller = cost_controller  # Optional CostController for budget management
 
         # Sub-systems
         from ..tools.base import ToolRegistry
@@ -460,12 +462,13 @@ class MainLoop:
             if context_text:
                 system_prompt += f"\n\nRelevant context:\n{context_text}"
 
-            resp = await asyncio.wait_for(
-                self.llm.chat([
+            resp = await self.llm.chat_with_retry(
+                [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": ctx.user_input},
-                ]),
-                timeout=25.0,
+                ],
+                max_retries=self.config.llm_max_retries,
+                timeout=self.config.llm_timeout,
             )
             ctx.final_output = resp.content
             ctx.reason_output = resp.content
@@ -583,6 +586,13 @@ class MainLoop:
         # ── Loop metrics ────────────────────────────────────────
         ctx.metrics = LoopMetrics()
         ctx.metrics.start()
+
+        # ── Budget check (optional) ──────────────────────────────
+        if self.cost_controller:
+            if not self.cost_controller.check(estimated_cost=0.01, task_scope="main"):
+                ctx.final_output = "预算超限，停止执行"
+                ctx.metrics.finish()
+                return ctx
 
         async def _check_handle():
             """Check task_handle at safe points during execution."""
