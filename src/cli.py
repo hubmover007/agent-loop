@@ -236,6 +236,11 @@ def cmd_chat(args):
         if ctx.errors:
             print(f"Errors: {ctx.errors}")
 
+        # Print loop metrics
+        if hasattr(ctx, 'metrics') and ctx.metrics:
+            print(f"\n--- Stats ---")
+            print(ctx.metrics.summary())
+
         # Cleanup
         if hasattr(memory, 'disconnect'):
             await memory.disconnect()

@@ -224,6 +224,9 @@ class LoopContext:
     final_output: str = ""
     errors: list[str] = field(default_factory=list)
 
+    # Metrics (set by MainLoop.run)
+    metrics: Any = None
+
 
 # ============================================================
 # ToolLoop

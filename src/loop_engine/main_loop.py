@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 from . import LoopConfig, LoopContext, AgentLoop, ToolLoop, LLMProvider
 from .deep_reason import DeepReasonLoop, DeepReasonConfig
+from .metrics import LoopMetrics
 from ..core import LoopPhase, TaskStatus, ToolResult, DiscardRecord
 from ..memory import MemoryPool
 from ..memory.graph_route import GraphRouter
@@ -408,6 +409,10 @@ class MainLoop:
         t0 = time.time()
         logger.info("MainLoop[%s]: SIMPLE_RUN for '%s'", ctx.session_id, ctx.user_input[:50])
 
+        # Metrics for simple run
+        ctx.metrics.start_phase("input")
+        ctx.metrics.end_phase("input")
+
         async def _check():
             if task_handle:
                 await task_handle.wait_if_paused()
@@ -420,6 +425,7 @@ class MainLoop:
             return ctx
 
         # Phase: RETRIEVE (lightweight — skip DeepReason in retriever)
+        ctx.metrics.start_phase("retrieve")
         try:
             ctx.current_phase = LoopPhase.RETRIEVE
             mem_ctx = await asyncio.wait_for(
@@ -433,6 +439,7 @@ class MainLoop:
             ctx.memory_context = mem_ctx
         except (asyncio.TimeoutError, Exception) as e:
             logger.warning("Simple retrieve skipped: %s", e)
+        ctx.metrics.end_phase("retrieve")
 
         if await _check():
             ctx.final_output = "任务已取消"
@@ -447,6 +454,7 @@ class MainLoop:
             )
 
         # Single LLM call — no iterative reasoning
+        ctx.metrics.start_phase("reason")
         try:
             system_prompt = "You are a helpful assistant. Answer concisely and directly."
             if context_text:
@@ -461,16 +469,35 @@ class MainLoop:
             )
             ctx.final_output = resp.content
             ctx.reason_output = resp.content
+
+            # Record token usage
+            if hasattr(resp, 'usage') and resp.usage:
+                pt = resp.usage.get('input_tokens', resp.usage.get('prompt_tokens', 0))
+                ct = resp.usage.get('output_tokens', resp.usage.get('completion_tokens', 0))
+                ctx.metrics.record_llm_call(prompt_tokens=pt, completion_tokens=ct)
+            else:
+                ctx.metrics.record_llm_call()
+
+            ctx.metrics.end_phase("reason")
             logger.info(
                 "MainLoop[%s]: SIMPLE_RUN done (%.1fs)",
                 ctx.session_id, time.time() - t0,
             )
         except asyncio.TimeoutError:
+            ctx.metrics.end_phase("reason")
+            ctx.metrics.record_error()
             ctx.final_output = "抱歉，回复超时了，请再试一次。"
             ctx.errors.append("Simple query LLM timeout")
         except Exception as e:
+            ctx.metrics.end_phase("reason")
+            ctx.metrics.record_error()
             ctx.final_output = f"处理出错: {e}"
             ctx.errors.append(str(e))
+
+        ctx.metrics.start_phase("output")
+        ctx.metrics.end_phase("output")
+        ctx.metrics.finish()
+        logger.info("MainLoop[%s]: SIMPLE_RUN metrics\n%s", ctx.session_id, ctx.metrics.summary())
 
         # Save episode
         try:
@@ -553,6 +580,10 @@ class MainLoop:
             ctx = LoopContext(user_input=user_input)
             ctx.media_blocks = []
 
+        # ── Loop metrics ────────────────────────────────────────
+        ctx.metrics = LoopMetrics()
+        ctx.metrics.start()
+
         async def _check_handle():
             """Check task_handle at safe points during execution."""
             if task_handle is not None:
@@ -613,12 +644,14 @@ class MainLoop:
                 break
 
             phase_start = time.time()
+            ctx.metrics.start_phase(phase_name)
             logger.info("MainLoop[%s]: phase=%s START", ctx.session_id, phase_name)
 
             try:
                 # Run phase with timeout
                 await asyncio.wait_for(phase(ctx), timeout=phase_timeout)
                 phase_elapsed = time.time() - phase_start
+                ctx.metrics.end_phase(phase_name)
 
                 if self.tracer and phase_span:
                     self.tracer.end_span(phase_span, "ok")
@@ -630,6 +663,8 @@ class MainLoop:
                 )
 
             except asyncio.TimeoutError:
+                ctx.metrics.end_phase(phase_name)
+                ctx.metrics.record_error()
                 logger.error(
                     "MainLoop[%s]: phase=%s TIMEOUT after %.1fs",
                     ctx.session_id, phase_name, phase_timeout,
@@ -639,6 +674,8 @@ class MainLoop:
                     self.tracer.end_span(phase_span, "timeout")
 
             except Exception as e:
+                ctx.metrics.end_phase(phase_name)
+                ctx.metrics.record_error()
                 logger.error("Phase %s failed: %s", phase_name, e)
                 ctx.errors.append(f"Error in {phase_name}: {e}")
                 if self.tracer and phase_span:
@@ -657,5 +694,6 @@ class MainLoop:
             self.tracer.end_span(loop_span, "error" if ctx.errors else "ok")
 
         elapsed = time.time() - run_start
-        logger.info("MainLoop[%s]: END (%.1fs)", ctx.session_id, elapsed)
+        ctx.metrics.finish()
+        logger.info("MainLoop[%s]: END (%.1fs)\n%s", ctx.session_id, elapsed, ctx.metrics.summary())
         return ctx
