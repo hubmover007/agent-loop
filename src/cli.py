@@ -445,6 +445,64 @@ def cmd_cleanup(args):
     asyncio.run(run())
 
 
+def cmd_consolidate(args):
+    """Run LLM-driven memory consolidation."""
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+
+    async def run():
+        from src.memory import MemoryPool
+
+        memory = MemoryPool(args.memory_url)
+        if args.memory_url.startswith("surrealdb://") or args.memory_url.startswith("ws://"):
+            await memory.connect()
+
+        # Optional LLM provider
+        llm = None
+        if args.provider:
+            from src.llm import create_provider
+            llm = create_provider(
+                args.provider,
+                api_key=args.api_key or os.environ.get("LLM_API_KEY", ""),
+            )
+
+        print(f"=== Memory Consolidation ===")
+        if args.dry_run:
+            print("(DRY RUN — no changes will be made)")
+
+        if args.dry_run:
+            # Just count unconsolidated episodes
+            episodes = await memory.get_unconsolidated_episodes(limit=50)
+            print(f"Unconsolidated episodes: {len(episodes)}")
+            if episodes:
+                unconsolidated = [e for e in episodes if not e.get("consolidated", False)]
+                print(f"  Pending consolidation: {len(unconsolidated)}")
+                for ep in unconsolidated[:5]:
+                    print(f"  - {ep.get('title', '?')[:60]}")
+                if len(unconsolidated) > 5:
+                    print(f"  ... and {len(unconsolidated) - 5} more")
+            print(f"Min episodes threshold: {args.min_episodes}")
+            print(f"Would run: {'NO' if len(episodes) < args.min_episodes else 'YES'}")
+        else:
+            result = await memory.consolidate(
+                llm_provider=llm,
+                min_episodes=args.min_episodes,
+                max_episodes_per_run=args.max_episodes,
+                prune_threshold=args.prune_threshold,
+                enable_linking=not args.no_linking,
+                enable_resolution=not args.no_resolution,
+                enable_pruning=not args.no_pruning,
+            )
+            print(f"\nResult: {result.to_summary()}")
+            if result.errors:
+                for err in result.errors:
+                    print(f"  Error: {err}")
+
+        if args.memory_url.startswith("surrealdb://") or args.memory_url.startswith("ws://"):
+            await memory.disconnect()
+
+    asyncio.run(run())
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="agent-loop",
@@ -522,6 +580,28 @@ def main():
                            help="Delete episodes older than N days (default: 30)")
     p_cleanup.add_argument("--memory-url", default="surrealdb://localhost:8000")
     p_cleanup.set_defaults(func=cmd_cleanup)
+
+    # consolidate
+    p_cons = sub.add_parser("consolidate", help="Run LLM-driven memory consolidation")
+    p_cons.add_argument("--dry-run", action="store_true",
+                        help="Show what would be consolidated without making changes")
+    p_cons.add_argument("--min-episodes", type=int, default=3,
+                        help="Minimum episodes before consolidation (default: 3)")
+    p_cons.add_argument("--max-episodes", type=int, default=50,
+                        help="Maximum episodes per run (default: 50)")
+    p_cons.add_argument("--prune-threshold", type=float, default=0.3,
+                        help="Confidence below which memories are pruned (default: 0.3)")
+    p_cons.add_argument("--no-linking", action="store_true",
+                        help="Disable graph edge creation phase")
+    p_cons.add_argument("--no-resolution", action="store_true",
+                        help="Disable contradiction resolution phase")
+    p_cons.add_argument("--no-pruning", action="store_true",
+                        help="Disable memory pruning phase")
+    p_cons.add_argument("--memory-url", default="surrealdb://localhost:8000")
+    p_cons.add_argument("--provider", default=None,
+                        help="LLM provider for extraction (default: none, uses heuristic)")
+    p_cons.add_argument("--api-key", default=None)
+    p_cons.set_defaults(func=cmd_consolidate)
 
     args = parser.parse_args()
     if not args.command:

@@ -73,6 +73,7 @@ DEFINE FIELD output ON episode TYPE string DEFAULT "";
 DEFINE FIELD task_count ON episode TYPE int DEFAULT 0;
 DEFINE FIELD session_id ON episode TYPE string DEFAULT "";
 DEFINE FIELD consolidated ON episode TYPE bool DEFAULT false;
+DEFINE FIELD consolidated_at ON episode TYPE option<datetime>;
 DEFINE FIELD created_at ON episode TYPE datetime DEFAULT time::now();
 DEFINE FIELD updated_at ON episode TYPE datetime DEFAULT time::now();
 

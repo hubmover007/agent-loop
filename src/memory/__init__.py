@@ -766,11 +766,12 @@ class MemoryPool:
 
     async def mark_episode_consolidated(self, episode_id: str) -> None:
         """Mark an episode as consolidated."""
+        now_iso = datetime.now(timezone.utc).isoformat()
         if self._db:
             try:
                 await self._db.query(
-                    "UPDATE episode SET consolidated = true WHERE id = $id",
-                    {"id": episode_id}
+                    "UPDATE episode SET consolidated = true, consolidated_at = <datetime>($now) WHERE id = $id",
+                    {"id": episode_id, "now": now_iso}
                 )
             except Exception as e:
                 logger.warning("Mark episode consolidated failed: %s", e)
@@ -778,6 +779,7 @@ class MemoryPool:
             for r in self._mem.get("episode", []):
                 if r.get("id") == episode_id:
                     r["consolidated"] = True
+                    r["consolidated_at"] = now_iso
                     break
 
     # ============================================================
@@ -893,6 +895,43 @@ class MemoryPool:
                 consolidated_count, deleted_count
             )
         return {"consolidated": consolidated_count, "deleted": deleted_count}
+
+    async def consolidate(self, llm_provider=None,
+                          min_episodes: int = 3,
+                          max_episodes_per_run: int = 50,
+                          prune_threshold: float = 0.3,
+                          enable_linking: bool = True,
+                          enable_resolution: bool = True,
+                          enable_pruning: bool = True) -> "ConsolidationResult":
+        """Run LLM-driven memory consolidation.
+
+        Five-phase pipeline: Gather → Extract → Link → Resolve → Prune.
+
+        Args:
+            llm_provider: LLM provider for extraction and resolution.
+                          Falls back to heuristic extraction if None.
+            min_episodes: Minimum episodes before consolidation triggers.
+            max_episodes_per_run: Cap on episodes per run.
+            prune_threshold: Confidence below which memories are pruned.
+            enable_linking: Enable graph edge creation.
+            enable_resolution: Enable contradiction detection.
+            enable_pruning: Enable low-value memory pruning.
+
+        Returns:
+            ConsolidationResult with per-phase counts.
+        """
+        from .consolidation import ConsolidationEngine
+        engine = ConsolidationEngine(
+            memory_pool=self,
+            llm_provider=llm_provider,
+            min_episodes=min_episodes,
+            max_episodes_per_run=max_episodes_per_run,
+            prune_threshold=prune_threshold,
+            enable_linking=enable_linking,
+            enable_resolution=enable_resolution,
+            enable_pruning=enable_pruning,
+        )
+        return await engine.run()
 
     # ============================================================
     # Graph Traversal
