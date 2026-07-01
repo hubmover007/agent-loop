@@ -66,9 +66,21 @@ class DeepReasonLoop:
     provides the external refinement cycle.
     """
 
-    def __init__(self, llm: LLMProvider, config: DeepReasonConfig | None = None):
+    def __init__(self, llm: LLMProvider, config: DeepReasonConfig | None = None,
+                 llm_pool: Any | None = None):
         self.llm = llm
         self.config = config or DeepReasonConfig()
+        self.llm_pool = llm_pool
+
+    def _get_llm(self) -> LLMProvider:
+        """Get the best LLM for deep reasoning, falling back to default."""
+        if self.llm_pool:
+            provider = self.llm_pool.get_provider(
+                capabilities=["reasoning"], strategy="most_capable"
+            )
+            if provider:
+                return provider
+        return self.llm
 
     async def reason(self, query: str, context: str = "",
                      system_prompt: str | None = None,
@@ -119,10 +131,16 @@ class DeepReasonLoop:
             )
 
             try:
-                response = await self.llm.chat(
-                    messages,
-                    thinking=self.config.enable_latent_thinking,
-                    temperature=temperature,
+                # Direct chat with timeout — no retry layer to avoid double-timeout issues
+                llm = self._get_llm()
+                response = await asyncio.wait_for(
+                    llm.chat(
+                        messages,
+                        thinking=self.config.enable_latent_thinking,
+                        temperature=temperature,
+                        max_tokens=800,  # Reduced from 2000 to stay within timeout
+                    ),
+                    timeout=20.0,
                 )
             except Exception as e:
                 logger.error("Reason iteration %d failed: %s", iteration, e)

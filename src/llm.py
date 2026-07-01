@@ -77,7 +77,7 @@ class DeepSeekProvider(LLMProvider):
             ] + messages
 
         try:
-            resp = await self._client.post("/v1/chat/completions", json=payload)
+            resp = await self._client.post("/chat/completions", json=payload)
             resp.raise_for_status()
             data = resp.json()
 
@@ -297,7 +297,7 @@ class OpenAICompatibleProvider(LLMProvider):
             payload["tool_choice"] = tool_choice
 
         try:
-            resp = await self._client.post("/v1/chat/completions", json=payload)
+            resp = await self._client.post("/chat/completions", json=payload)
             resp.raise_for_status()
             data = resp.json()
 
@@ -341,7 +341,7 @@ class OpenAICompatibleProvider(LLMProvider):
             payload["tool_choice"] = tool_choice
 
         try:
-            async with self._client.stream("POST", "/v1/chat/completions", json=payload) as resp:
+            async with self._client.stream("POST", "/chat/completions", json=payload) as resp:
                 resp.raise_for_status()
                 buffer = b""
                 async for chunk in resp.aiter_bytes():
@@ -414,8 +414,8 @@ def create_provider(provider_type: str, **kwargs) -> LLMProvider:
 
     # EasyRouter: set default endpoint and API key
     if provider_type == "easyrouter":
-        kwargs.setdefault("base_url", "https://easyrouter.io/v1")
+        kwargs.setdefault("base_url", "https://easyrouter.io")
         kwargs.setdefault("api_key", os.environ.get("EASYROUTER_API_KEY", ""))
-        kwargs.setdefault("default_model", "deepseek-v4-pro")
+        kwargs.setdefault("default_model", "gemini-2.5-flash")
 
     return cls(**kwargs)

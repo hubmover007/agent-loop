@@ -66,7 +66,7 @@ def _resolve_api_key(api_key_source: str) -> str:
     return api_key_source  # literal key
 
 
-def _create_llm_from_config(args: argparse.Namespace) -> "LLMProvider":
+def _create_llm_from_config(args: argparse.Namespace):
     """Create LLM provider from config, preferring LLMPool if available.
 
     Priority:
@@ -77,23 +77,41 @@ def _create_llm_from_config(args: argparse.Namespace) -> "LLMProvider":
     from src.llm_pool import LLMPool
     from src.llm import create_provider, OpenAICompatibleProvider
 
-    # Try LLMPool first
+    # Try LLMPool first — prefer fast models for responsiveness
     pool_path = Path("config/llm_pool.json")
     if pool_path.exists():
         try:
             pool = LLMPool(str(pool_path))
             pool.initialize()
             if pool._pool_config:
+                # Prefer fast non-reasoning models for lower latency
+                PREFERRED_MODELS = ["gemini-2.5-flash", "gpt-5.5", "glm-5-turbo", "kimi-k2.6", "deepseek-v4-flash"]
+                providers_by_model = {}
                 for cfg in pool._pool_config.providers:
                     if cfg.enabled:
                         api_key = _resolve_api_key(cfg.api_key_source)
                         if api_key:
-                            logger.info("Using LLM from LLMPool: %s (%s)", cfg.id, cfg.model)
-                            return OpenAICompatibleProvider(
-                                base_url=cfg.endpoint,
-                                api_key=api_key,
-                                default_model=cfg.model,
-                            )
+                            providers_by_model[cfg.model] = cfg
+                
+                # Try preferred models first
+                chosen = None
+                for model in PREFERRED_MODELS:
+                    if model in providers_by_model:
+                        chosen = providers_by_model[model]
+                        break
+                # Fallback to first available
+                if not chosen and providers_by_model:
+                    chosen = next(iter(providers_by_model.values()))
+                
+                if chosen:
+                    api_key = _resolve_api_key(chosen.api_key_source)
+                    logger.info("Using LLM from LLMPool: %s (%s)", chosen.id, chosen.model)
+                    provider = OpenAICompatibleProvider(
+                        base_url=chosen.endpoint,
+                        api_key=api_key,
+                        default_model=chosen.model,
+                    )
+                    return provider, pool
         except Exception as e:
             logger.warning("LLMPool load failed: %s, falling back", e)
 
@@ -102,11 +120,11 @@ def _create_llm_from_config(args: argparse.Namespace) -> "LLMProvider":
     if provider_type == "easyrouter":
         api_key = args.api_key or os.environ.get("EASYROUTER_API_KEY", "")
         logger.info("Using EasyRouter provider (fallback)")
-        return create_provider("easyrouter", api_key=api_key)
+        return create_provider("easyrouter", api_key=api_key), None
     else:
         api_key = args.api_key or os.environ.get("LLM_API_KEY", "")
         logger.info("Using provider: %s", provider_type)
-        return create_provider(provider_type, api_key=api_key)
+        return create_provider(provider_type, api_key=api_key), None
 
 
 def cmd_init_config(args):
@@ -220,10 +238,10 @@ def cmd_chat(args):
             await memory.initialize_schema()
 
         # ── Initialize LLM (LLMPool preferred, fallback create_provider) ──
-        llm = _create_llm_from_config(args)
+        llm, llm_pool = _create_llm_from_config(args)
 
         config = LoopConfig()
-        loop = MainLoop(memory=memory, llm=llm, config=config)
+        loop = MainLoop(memory=memory, llm=llm, config=config, llm_pool=llm_pool)
 
         # Run
         print(f"User: {args.message}")
@@ -263,9 +281,9 @@ def cmd_serve(args):
     memory = MemoryPool(args.memory_url)
     # MemoryPool will be connected on first use via the app lifecycle
 
-    llm = _create_llm_from_config(args)
+    llm, llm_pool = _create_llm_from_config(args)
     config = LoopConfig()
-    app = create_app(memory=memory, llm=llm, config=config)
+    app = create_app(memory=memory, llm=llm, config=config, llm_pool=llm_pool)
 
     print(f"Agent-Loop API serving on http://{args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port)
@@ -370,7 +388,7 @@ def cmd_start(args):
         print("[4/6] InteractionHub + MailRouter + PersistenceManager initialized")
 
         # 5. Create LLM and memory
-        llm = _create_llm_from_config(args)
+        llm, llm_pool = _create_llm_from_config(args)
         memory = MemoryPool(memory_url)
         if memory_url.startswith("ws://") or memory_url.startswith("surrealdb://"):
             try:
@@ -388,8 +406,9 @@ def cmd_start(args):
             tool_loop=None,  # will be set up later
             llm=llm,
             config=config,
+            llm_pool=llm_pool,
         )
-        task_agent = TaskAgent(llm=llm, registry=registry)
+        task_agent = TaskAgent(llm=llm, registry=registry, llm_pool=llm_pool)
         manager = AgentManagerAgent(
             memory=memory,
             agent_loop=agent_loop,

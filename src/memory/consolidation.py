@@ -72,7 +72,8 @@ class ConsolidationEngine:
                  prune_threshold: float = 0.3,
                  enable_linking: bool = True,
                  enable_resolution: bool = True,
-                 enable_pruning: bool = True):
+                 enable_pruning: bool = True,
+                 llm_pool: Any | None = None):
         self.memory = memory_pool
         self.llm = llm_provider
         self.anchor = anchor_manager
@@ -82,7 +83,18 @@ class ConsolidationEngine:
         self.enable_linking = enable_linking
         self.enable_resolution = enable_resolution
         self.enable_pruning = enable_pruning
+        self.llm_pool = llm_pool
         self._last_consolidation: str | None = None
+
+    def _get_llm(self, capabilities: list[str], strategy: str):
+        """Get the best LLM for a given capability+strategy, falling back to default."""
+        if self.llm_pool:
+            provider = self.llm_pool.get_provider(
+                capabilities=capabilities, strategy=strategy
+            )
+            if provider:
+                return provider
+        return self.llm
 
     async def run(self) -> ConsolidationResult:
         """Run full consolidation pipeline."""
@@ -180,7 +192,8 @@ class ConsolidationEngine:
         )
 
         try:
-            resp = await self.llm.chat([
+            llm = self._get_llm(["general"], "cheapest")
+            resp = await llm.chat([
                 {
                     "role": "system",
                     "content": "You are a memory consolidation engine. Extract structured records.",

@@ -98,18 +98,30 @@ class UnifiedRetriever:
     """
 
     def __init__(self, memory_pool: Any, graph_router: Any,
-                 deep_reason: Any, llm: Any):
+                 deep_reason: Any, llm: Any, llm_pool: Any | None = None):
         """
         Args:
             memory_pool: MemoryPool (SurrealDB backend)
             graph_router: GraphRouter (M-FLOW graph routing)
             deep_reason: DeepReasonLoop (RDT-style iterative reasoning)
             llm: LLMProvider (for embedding + reasoning)
+            llm_pool: Optional LLMPool for capability-based model selection
         """
         self.memory = memory_pool
         self.graph_router = graph_router
         self.deep_reason = deep_reason
         self.llm = llm
+        self.llm_pool = llm_pool
+
+    def _get_llm(self, capabilities: list[str], strategy: str):
+        """Get the best LLM for a given capability+strategy, falling back to default."""
+        if self.llm_pool:
+            provider = self.llm_pool.get_provider(
+                capabilities=capabilities, strategy=strategy
+            )
+            if provider:
+                return provider
+        return self.llm
 
     async def retrieve(self, query: str, max_hops: int = 3,
                        deep_reason_iterations: int = 3) -> MemoryContext:
@@ -138,7 +150,17 @@ class UnifiedRetriever:
                 query=query,
             )
 
-            context.explicit = graph_results
+            # Convert RetrieveResult objects to dicts for MemoryContext
+            context.explicit = [
+                {
+                    "layer": getattr(r, "node_type", "unknown"),
+                    "title": r.episode_data.get("title", r.episode_data.get("name", "")),
+                    "summary": r.episode_data.get("summary", r.episode_data.get("description", "")),
+                    "score": r.score,
+                    "data": r.episode_data,
+                }
+                for r in graph_results
+            ]
             context.graph_hops = max_hops
 
             logger.debug("UnifiedRetriever: graph returned %d items",
@@ -185,16 +207,23 @@ class UnifiedRetriever:
             return [0.0] * DEFAULT_EMBEDDING_DIM
 
     @staticmethod
-    def _format_graph_context(graph_results: list[dict]) -> str:
+    def _format_graph_context(graph_results: list) -> str:
         """Format graph results as context string for deep reasoning."""
         if not graph_results:
             return "No explicit memory found. Recall from parametric knowledge."
 
         parts = ["Retrieved memory graph facts:"]
         for i, item in enumerate(graph_results[:5], 1):
-            layer = item.get("layer", "?")
-            title = item.get("title", "untitled")
-            summary = item.get("summary", "")
+            # Handle both RetrieveResult objects and dicts
+            if hasattr(item, 'episode_data'):
+                data = item.episode_data
+                layer = getattr(item, 'node_type', '?')
+                title = data.get("title", data.get("name", "untitled"))
+                summary = data.get("summary", data.get("description", ""))
+            else:
+                layer = item.get("layer", "?")
+                title = item.get("title", "untitled")
+                summary = item.get("summary", "")
             parts.append(f"  {i}. [{layer}] {title}: {summary}")
 
         parts.append("\nSynthesize these facts with your parametric knowledge.")
@@ -309,7 +338,8 @@ Only include meaningful triples. Skip if nothing substantive."""
 
         try:
             from ..utils import extract_json_from_llm_response as _ejfr
-            response = await self.llm.chat([{"role": "user", "content": prompt}])
+            llm = self._get_llm(["quick"], "cheapest")
+            response = await llm.chat([{"role": "user", "content": prompt}])
             triples = _ejfr(response.content, default=[])
             return triples if isinstance(triples, list) else []
         except Exception as e:

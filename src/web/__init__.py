@@ -19,7 +19,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Any
 
 from pathlib import Path
 
@@ -78,7 +78,8 @@ if FastAPI:
 # ============================================================
 
 def create_app(memory: MemoryPool, llm: LLMProvider,
-               config: LoopConfig | None = None) -> FastAPI:
+               config: LoopConfig | None = None,
+               llm_pool: Any | None = None) -> FastAPI:
     """Create and configure the FastAPI app.
 
     Usage:
@@ -91,7 +92,7 @@ def create_app(memory: MemoryPool, llm: LLMProvider,
         )
 
     config = config or LoopConfig()
-    main_loop = MainLoop(memory=memory, llm=llm, config=config)
+    main_loop = MainLoop(memory=memory, llm=llm, config=config, llm_pool=llm_pool)
     task_dispatcher = TaskDispatcher(main_loop=main_loop)
 
     @asynccontextmanager

@@ -679,6 +679,22 @@ class LLMPool:
 
         return candidates[0] if candidates else None
 
+    def get_provider(self, capabilities: list[str] | None = None,
+                     strategy: str | None = None,
+                     task_type: str | None = None) -> "PoolManagedProvider | None":
+        """Select and return a provider instance (fast path, no acquire).
+
+        Uses select() internally to find the best config, then looks up
+        the pre-built provider instance. Returns None if no match found.
+
+        This is the recommended method for subsystems to get a
+        capability-matched LLM without the full acquire flow.
+        """
+        cfg = self.select(capabilities=capabilities, strategy=strategy, task_type=task_type)
+        if cfg:
+            return self._providers.get(cfg.id)
+        return None
+
     # ── Modality-aware selection ───────────────────────────────────
 
     def get_vision_model(self) -> ProviderConfigJSON | None:

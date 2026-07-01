@@ -168,7 +168,7 @@ class GraphRouter:
             rows = result if isinstance(result, list) else result.get("result", [])
             return [
                 SearchResult(
-                    node_id=row["id"],
+                    node_id=str(row["id"]),
                     node_type=table,
                     distance=self._cosine_distance(row.get("embedding", []), query_embedding),
                     data=row,

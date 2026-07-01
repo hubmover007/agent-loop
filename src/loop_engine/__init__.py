@@ -40,7 +40,7 @@ DEFAULT_TIMEOUT_SECONDS = 300
 class LoopConfig:
     """Configuration for the Loop Engine."""
     # MainLoop
-    max_reason_loops: int = 3           # Max internal reasoning iterations (reduced for responsiveness)
+    max_reason_loops: int = 1           # Max internal reasoning iterations (1 for fast response, increase for complex reasoning)
     reason_confidence_threshold: float = 0.85  # ACT: stop when confidence > threshold
     max_agent_concurrent: int = 50       # Max concurrent agents
 
@@ -163,6 +163,12 @@ class LLMProvider(ABC):
                 logger.info("Retrying in %.1fs...", delay)
                 await asyncio.sleep(delay)
 
+        if last_error is None:
+            # max_retries == 0: make at least one attempt without retry
+            return await asyncio.wait_for(
+                self.chat(messages, **kwargs),
+                timeout=timeout,
+            )
         raise last_error  # type: ignore[misc]
 
     async def chat_stream(self, messages: list[dict],
@@ -305,7 +311,8 @@ class AgentLoop:
                  max_iterations: int = DEFAULT_MAX_ITERATIONS,
                  timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
                  plan_mode: bool = False,
-                 max_replans: int = 3):
+                 max_replans: int = 3,
+                 llm_pool: Any | None = None):
         self.tool_loop = tool_loop
         self.llm = llm
         self.config = config
@@ -322,9 +329,20 @@ class AgentLoop:
         self.timeout_seconds = timeout_seconds  # P0: Agent timeout in seconds
         self.plan_mode = plan_mode  # P2.5: Plan mode — require user approval before executing
         self.max_replans = max_replans  # P2: Max replan attempts on low eval score
+        self.llm_pool = llm_pool  # Optional LLMPool for capability-based model selection
         self._replan_context: dict | None = None  # P2: Context for replan feedback
         self._verify_config: dict | None = None  # P2.5: Per-step verification config
         self._last_eval_reason: str = ""  # P2: Latest eval reason for replan feedback
+
+    def _get_llm(self, capabilities: list[str], strategy: str) -> LLMProvider:
+        """Get the best LLM for a given capability+strategy, falling back to default."""
+        if self.llm_pool:
+            provider = self.llm_pool.get_provider(
+                capabilities=capabilities, strategy=strategy
+            )
+            if provider:
+                return provider
+        return self.llm
 
     async def run(self, agent_id: str, task_scope: str, context: dict,
                   allowed_tools: list[str],
@@ -824,7 +842,8 @@ class AgentLoop:
         """
         try:
             fix_prompt = f"Step '{step}' failed with error: {error}\nPlease fix it."
-            response = await self.llm.chat([
+            llm = self._get_llm(["coding"], "cheapest")
+            response = await llm.chat([
                 {"role": "system", "content": "You are a code fixer."},
                 {"role": "user", "content": fix_prompt},
             ])
@@ -861,8 +880,9 @@ Keep it concise, maximum """ + str(self.config.max_agent_steps) + """ steps.
 Respond with ONLY the JSON array, no other text."""
 
         try:
+            llm = self._get_llm(["reasoning"], "most_capable")
             response = await asyncio.wait_for(
-                self.llm.chat([{"role": "user", "content": prompt}]),
+                llm.chat([{"role": "user", "content": prompt}]),
                 timeout=60.0,
             )
             from ..utils import extract_json_from_llm_response
@@ -901,8 +921,9 @@ Errors: {errors if errors else 'none'}
 Output JSON only: {{"score": <number between 0 and 1>, "reason": "<brief explanation>"}}"""
 
         try:
+            llm = self._get_llm(["general"], "cheapest")
             response = await asyncio.wait_for(
-                self.llm.chat([{"role": "user", "content": prompt}]),
+                llm.chat([{"role": "user", "content": prompt}]),
                 timeout=30.0,
             )
             from ..utils import extract_json_from_llm_response
@@ -958,8 +979,9 @@ Errors encountered: {errors if errors else 'none'}
 Provide a concise summary:"""
 
         try:
+            llm = self._get_llm(["general"], "cheapest")
             response = await asyncio.wait_for(
-                self.llm.chat([{"role": "user", "content": prompt}]),
+                llm.chat([{"role": "user", "content": prompt}]),
                 timeout=30.0,
             )
             summary = response.content.strip()

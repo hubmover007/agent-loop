@@ -115,12 +115,12 @@ class TestCreateLLMFromConfig:
             args.provider = None
             args.api_key = None
 
-            llm = _create_llm_from_config(args)
+            llm, pool = _create_llm_from_config(args)
             from src.llm import OpenAICompatibleProvider
             assert isinstance(llm, OpenAICompatibleProvider)
-            assert llm.base_url == "https://easyrouter.io/v1"
+            assert llm.base_url == "https://easyrouter.io"
             assert llm.api_key == "test-er-key"
-            assert llm.default_model == "deepseek-v4-pro"
+            assert llm.default_model == "gemini-2.5-flash"
 
     def test_fallback_to_easyrouter_via_create_provider(self):
         """When no pool, use create_provider('easyrouter')."""
@@ -132,9 +132,9 @@ class TestCreateLLMFromConfig:
             args.provider = None
             args.api_key = None
 
-            llm = _create_llm_from_config(args)
-            assert llm.base_url == "https://easyrouter.io/v1"
-            assert llm.default_model == "deepseek-v4-pro"
+            llm, pool = _create_llm_from_config(args)
+            assert llm.base_url == "https://easyrouter.io"
+            assert llm.default_model == "gemini-2.5-flash"
 
     def test_uses_arg_provider_when_set(self):
         """When --provider is explicitly set, use create_provider."""
@@ -146,7 +146,7 @@ class TestCreateLLMFromConfig:
             args.provider = "easyrouter"
             args.api_key = None
 
-            llm = _create_llm_from_config(args)
+            llm, pool = _create_llm_from_config(args)
             from src.llm import OpenAICompatibleProvider
             assert isinstance(llm, OpenAICompatibleProvider)
 
@@ -188,7 +188,7 @@ class TestCreateLLMFromConfig:
             args.provider = None
             args.api_key = None
 
-            llm = _create_llm_from_config(args)
+            llm, pool = _create_llm_from_config(args)
             from src.llm import OpenAICompatibleProvider
             assert isinstance(llm, OpenAICompatibleProvider)
             assert llm.base_url == "https://api.test.com/v1"
@@ -248,7 +248,7 @@ class TestCreateLLMFromConfig:
             args.provider = None
             args.api_key = None
 
-            llm = _create_llm_from_config(args)
+            llm, pool = _create_llm_from_config(args)
             assert llm.base_url == "https://enabled.example.com/v1"
             assert llm.default_model == "enabled-model"
 
@@ -264,7 +264,7 @@ class TestCreateLLMFromConfig:
                 args.provider = None
                 args.api_key = None
 
-                llm = _create_llm_from_config(args)
+                llm, pool = _create_llm_from_config(args)
                 from src.llm import OpenAICompatibleProvider
                 assert isinstance(llm, OpenAICompatibleProvider)
                 # Key will be empty, which is acceptable (provider handles error on use)
@@ -284,9 +284,9 @@ class TestCreateProviderEasyRouter:
 
         provider = create_provider("easyrouter", api_key="test-key-123")
         assert isinstance(provider, OpenAICompatibleProvider)
-        assert provider.base_url == "https://easyrouter.io/v1"
+        assert provider.base_url == "https://easyrouter.io"
         assert provider.api_key == "test-key-123"
-        assert provider.default_model == "deepseek-v4-pro"
+        assert provider.default_model == "gemini-2.5-flash"
 
     def test_easyrouter_uses_env_key(self):
         """EasyRouter should use EASYROUTER_API_KEY from env when no explicit key."""
@@ -309,7 +309,7 @@ class TestCreateProviderEasyRouter:
         from src.llm import create_provider
 
         provider = create_provider("easyrouter", api_key="test")
-        assert provider.default_model == "deepseek-v4-pro"
+        assert provider.default_model == "gemini-2.5-flash"
 
     def test_easyrouter_custom_model(self):
         """EasyRouter should accept custom default_model."""

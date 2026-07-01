@@ -275,9 +275,21 @@ class TaskAgent:
 
     role = AgentRole.MANAGER
 
-    def __init__(self, llm: LLMProvider, registry: TaskRegistry):
+    def __init__(self, llm: LLMProvider, registry: TaskRegistry,
+                 llm_pool: Any | None = None):
         self.llm = llm
         self.registry = registry
+        self.llm_pool = llm_pool
+
+    def _get_llm(self, capabilities: list[str], strategy: str):
+        """Get the best LLM for a given capability+strategy, falling back to default."""
+        if self.llm_pool:
+            provider = self.llm_pool.get_provider(
+                capabilities=capabilities, strategy=strategy
+            )
+            if provider:
+                return provider
+        return self.llm
 
     async def decompose(self, reasoning_output: str,
                         original_input: str) -> list[ManagedTask]:
@@ -315,7 +327,7 @@ class TaskAgent:
         prompt = f"""You are a Task Agent. Decompose the task into subtasks.
 
 Original: {original}
-Reasoning: {reasoning}
+Reasoning: {reasoning[:500]}
 
 Rules:
 - SIMPLE task → return single item
@@ -327,8 +339,12 @@ JSON:
 ```json
 [{{"scope": "...", "priority": 3, "required_tools": [], "dependencies": []}}]
 ```"""
-        resp = await self.llm.chat([{"role": "user", "content": prompt}])
-        from ..utils import extract_json_from_llm_response
+        llm = self._get_llm(["general"], "balanced")
+        if hasattr(llm, 'chat_with_retry'):
+            resp = await llm.chat_with_retry([{"role": "user", "content": prompt}], max_retries=2, timeout=18.0, max_tokens=1000)
+        else:
+            resp = await llm.chat([{"role": "user", "content": prompt}])
+        from src.utils import extract_json_from_llm_response
         result = extract_json_from_llm_response(resp.content, default=[])
         return result if isinstance(result, list) else [result]
 
@@ -364,8 +380,12 @@ Error: {failed_task.error}
 Attempts: {failed_task.retry_count}
 
 Return JSON array of alternative subtasks, or empty array if impossible."""
-            resp = await self.llm.chat([{"role": "user", "content": prompt}])
-            from ..utils import extract_json_from_llm_response
+            llm = self._get_llm(["general"], "balanced")
+            if hasattr(llm, 'chat_with_retry'):
+                resp = await llm.chat_with_retry([{"role": "user", "content": prompt}], max_retries=2, timeout=18.0, max_tokens=1000)
+            else:
+                resp = await llm.chat([{"role": "user", "content": prompt}])
+            from src.utils import extract_json_from_llm_response
             subtasks = extract_json_from_llm_response(resp.content, default=[])
             if not subtasks:
                 return None

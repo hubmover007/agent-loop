@@ -25,11 +25,11 @@ logger = logging.getLogger(__name__)
 # Phase timeout defaults (seconds)
 PHASE_TIMEOUTS: dict[str, float] = {
     "_input": 5.0,
-    "_retrieve": 15.0,
-    "_reason": 20.0,
-    "_decompose": 15.0,
-    "_dispatch": 10.0,
-    "_collect": 60.0,
+    "_retrieve": 10.0,
+    "_reason": 25.0,
+    "_decompose": 20.0,
+    "_dispatch": 5.0,
+    "_collect": 30.0,
     "_output": 10.0,
 }
 
@@ -49,7 +49,8 @@ class MainLoop:
                  state_store: Any | None = None,
                  tracer: Any | None = None,
                  anchor_manager: Any | None = None,
-                 cost_controller: Any | None = None):
+                 cost_controller: Any | None = None,
+                 llm_pool: Any | None = None):
         self.memory = memory
         self.llm = llm
         self.config = config or LoopConfig()
@@ -57,6 +58,12 @@ class MainLoop:
         self.tracer = tracer  # Optional Tracer for distributed tracing
         self.anchor_manager = anchor_manager  # Optional AnchorManager for O(1) key-fact lookup
         self.cost_controller = cost_controller  # Optional CostController for budget management
+        self.llm_pool = llm_pool  # Optional LLMPool for capability-based model selection
+
+        # System Agents: TaskAgent (manages tasks) + AgentManagerAgent (manages agents)
+        self.task_agent: TaskAgent | None = None
+        self.agent_manager: AgentManagerAgent | None = None
+        self.task_registry: TaskRegistry | None = None
 
         # Sub-systems
         from ..tools.base import ToolRegistry
@@ -64,11 +71,12 @@ class MainLoop:
         self.tool_registry.register_defaults()
         self.tool_loop = ToolLoop(self.tool_registry, self.config)
         self.graph_router = GraphRouter(memory)  # M-FLOW graph routing
-        self.agent_loop = AgentLoop(self.tool_loop, llm, self.config)
+        self.agent_loop = AgentLoop(self.tool_loop, llm, self.config, llm_pool=llm_pool)
         self.deep_reason = DeepReasonLoop(llm, DeepReasonConfig(
             max_iterations=self.config.max_reason_loops,
             confidence_threshold=self.config.reason_confidence_threshold,
-        ))
+            enable_latent_thinking=False,  # Disable for speed; use multi-iteration instead
+        ), llm_pool=llm_pool)
 
         # Unified Memory Retriever: M-FLOW graph + Mythos deep reasoning
         self.retriever = UnifiedRetriever(
@@ -76,12 +84,22 @@ class MainLoop:
             graph_router=self.graph_router,
             deep_reason=self.deep_reason,
             llm=llm,
+            llm_pool=llm_pool,
         )
 
-        # System Agents: TaskAgent (manages tasks) + AgentManagerAgent (manages agents)
-        self.task_agent: TaskAgent | None = None
-        self.agent_manager: AgentManagerAgent | None = None
-        self.task_registry: TaskRegistry | None = None
+    # ============================================================
+    # LLM selection helper
+    # ============================================================
+
+    def _get_llm(self, capabilities: list[str], strategy: str) -> LLMProvider:
+        """Get the best LLM for a given capability+strategy, falling back to default."""
+        if self.llm_pool:
+            provider = self.llm_pool.get_provider(
+                capabilities=capabilities, strategy=strategy
+            )
+            if provider:
+                return provider
+        return self.llm
 
     # ============================================================
     # 1. INPUT
@@ -157,11 +175,12 @@ class MainLoop:
                 )
 
         try:
-            # Unified retrieval: explicit graph + implicit deep reasoning
+            # Unified retrieval: explicit graph only (no deep reasoning during retrieve)
+            # Deep reasoning happens in _reason phase, not retrieve
             mem_ctx = await self.retriever.retrieve(
                 query=ctx.user_input,
                 max_hops=3,
-                deep_reason_iterations=3,
+                deep_reason_iterations=0,
             )
 
             # Store unified context for REASON phase
@@ -250,6 +269,7 @@ class MainLoop:
             self.task_agent = TaskAgent(
                 llm=self.llm,
                 registry=self.task_registry,
+                llm_pool=self.llm_pool,
             )
         if not self.agent_manager:
             from ..external_agents import ExternalAgentBridge
@@ -462,7 +482,8 @@ class MainLoop:
             if context_text:
                 system_prompt += f"\n\nRelevant context:\n{context_text}"
 
-            resp = await self.llm.chat_with_retry(
+            llm = self._get_llm(["quick"], "cheapest")
+            resp = await llm.chat_with_retry(
                 [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": ctx.user_input},
