@@ -302,6 +302,8 @@ class MainLoop:
                 config=self.config,
                 registry=self.task_registry,
                 external_bridge=ExternalAgentBridge(),
+                project=self.project,
+                tool_registry=self.tool_registry,
             )
 
         # TaskAgent uses LLM to decompose + register tasks

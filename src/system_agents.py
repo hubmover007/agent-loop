@@ -438,7 +438,9 @@ class AgentManagerAgent:
                  mail_router: Any | None = None,
                  persistence: Any | None = None,
                  permission_checker: Any | None = None,
-                 sandbox: Any | None = None):
+                 sandbox: Any | None = None,
+                 project: Any | None = None,
+                 tool_registry: Any | None = None):
         self.memory = memory
         self.agent_loop = agent_loop
         self.config = config
@@ -464,6 +466,12 @@ class AgentManagerAgent:
 
         # SandboxManager — tiered code execution isolation
         self.sandbox = sandbox
+
+        # Project workspace (shared space for all agents)
+        self.project = project
+
+        # Tool registry (for web search in AmmoRefiller)
+        self.tool_registry = tool_registry
 
         # Central event bus for progress events across all agents
         self._event_bus: asyncio.Queue = asyncio.Queue()
@@ -890,6 +898,30 @@ class AgentManagerAgent:
             # Otherwise fall back to the shared agent_loop with its default LLM
             bound_llm = getattr(agent, "_llm_provider", None)
             agent_emitter = getattr(agent, "_progress_emitter", None)
+
+            # ── Create AmmoBox + AmmoRefiller for this worker ──
+            from .ammo import AmmoBox, AmmoRefiller
+            worker_ammo = AmmoBox(max_tokens=2000)
+            worker_refiller = AmmoRefiller(
+                ammo_box=worker_ammo,
+                project=getattr(self, 'project', None),
+                memory=self.memory,
+                llm=bound_llm or self.agent_loop.llm,
+                web_tool=self.tool_registry.get("web") if self.tool_registry else None,
+                task_id=task.task_id,
+            )
+            # Inject project card as pinned context
+            if getattr(self, 'project', None):
+                card = self.project.load_card()
+                worker_ammo.add_pinned(card.to_context(), source="project_card")
+                # Load recent sessions
+                recent = self.project.load_recent_sessions(limit=3)
+                if recent:
+                    recent_text = "## 最近会话\n" + "\n".join(
+                        f"- {s.get('summary', '')[:100]}" for s in recent
+                    )
+                    worker_ammo.add_pinned(recent_text, source="recent")
+
             if bound_llm is not None:
                 from .loop_engine import AgentLoop as _AgentLoop
                 dedicated_loop = _AgentLoop(
@@ -901,6 +933,7 @@ class AgentManagerAgent:
                     emitter=agent_emitter,
                     sandbox=self.sandbox,
                     agent_permissions=getattr(agent, '_permissions', None),
+                    ammo_refiller=worker_refiller,
                 )
                 result = await agent.run(dedicated_loop, task.scope, context,
                                         allowed_tools=task.required_tools)
@@ -915,6 +948,7 @@ class AgentManagerAgent:
                     emitter=agent_emitter,
                     sandbox=self.sandbox,
                     agent_permissions=getattr(agent, '_permissions', None),
+                    ammo_refiller=worker_refiller,
                 )
                 result = await agent.run(loop_with_emitter, task.scope, context,
                                         allowed_tools=task.required_tools)

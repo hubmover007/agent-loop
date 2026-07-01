@@ -312,7 +312,8 @@ class AgentLoop:
                  timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
                  plan_mode: bool = False,
                  max_replans: int = 3,
-                 llm_pool: Any | None = None):
+                 llm_pool: Any | None = None,
+                 ammo_refiller: Any | None = None):
         self.tool_loop = tool_loop
         self.llm = llm
         self.config = config
@@ -330,6 +331,7 @@ class AgentLoop:
         self.plan_mode = plan_mode  # P2.5: Plan mode — require user approval before executing
         self.max_replans = max_replans  # P2: Max replan attempts on low eval score
         self.llm_pool = llm_pool  # Optional LLMPool for capability-based model selection
+        self.ammo_refiller = ammo_refiller  # Optional AmmoRefiller for context management
         self._replan_context: dict | None = None  # P2: Context for replan feedback
         self._verify_config: dict | None = None  # P2.5: Per-step verification config
         self._last_eval_reason: str = ""  # P2: Latest eval reason for replan feedback
@@ -448,6 +450,17 @@ class AgentLoop:
                 plan = await self._plan(task_scope, context)
                 steps.append(StepLog(step=0, action="plan", tool_name=None, output=plan))
                 _emit("phase_done", "PLAN", f"Plan generated: {len(plan)} steps")
+
+                # ── Ammo refill after PLAN ──────────────────────
+                if self.ammo_refiller:
+                    try:
+                        await self.ammo_refiller.check_and_refill({
+                            "phase": "PLAN",
+                            "plan": plan,
+                            "user_input": task_scope,
+                        })
+                    except Exception as e:
+                        logger.warning("AgentLoop[%s]: ammo refill after PLAN failed: %s", agent_id, e)
 
                 # P2.5: Plan Mode — request user approval
                 if self.plan_mode and self.interaction_hub:
@@ -642,6 +655,23 @@ class AgentLoop:
 
                     step_num += 1
 
+                    # ── Ammo refill after each EXECUTE step ────────
+                    if self.ammo_refiller:
+                        try:
+                            last_error = steps[-1].error if steps else None
+                            last_success = not bool(last_error)
+                            step_desc = steps[-1].action if steps else ""
+                            await self.ammo_refiller.check_and_refill({
+                                "phase": "EXECUTE",
+                                "step_num": step_num - 1,
+                                "last_error": last_error,
+                                "last_step_success": last_success,
+                                "step_desc": step_desc,
+                                "user_input": task_scope,
+                            })
+                        except Exception as e:
+                            logger.warning("AgentLoop[%s]: ammo refill in EXECUTE failed: %s", agent_id, e)
+
                     # Check TTL
                     if (datetime.now(timezone.utc) - started_at).total_seconds() > self.config.agent_ttl:
                         logger.warning("AgentLoop[%s]: TTL exceeded", agent_id)
@@ -656,6 +686,17 @@ class AgentLoop:
 
                 # Phase 3: SELF_EVAL
                 _emit("phase_start", "SELF_EVAL", "Running self-evaluation")
+
+                # ── Ammo review before SELF_EVAL ─────────────────
+                if self.ammo_refiller:
+                    try:
+                        await self.ammo_refiller.check_and_refill({
+                            "phase": "SELF_EVAL",
+                            "user_input": task_scope,
+                        })
+                    except Exception as e:
+                        logger.warning("AgentLoop[%s]: ammo review before EVAL failed: %s", agent_id, e)
+
                 eval_score = await self._self_evaluate(task_scope, steps, artifacts)
                 eval_reason = self._last_eval_reason
                 _emit("phase_done", "SELF_EVAL", f"Self-eval score: {eval_score:.2f}")
