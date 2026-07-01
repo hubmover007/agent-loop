@@ -239,14 +239,22 @@ class AnchorManager:
         if not self.memory or not self.memory._db:
             return 0
         try:
-            result = await self.memory._db.query(
+            # Count before delete (SurrealDB DELETE returns empty list)
+            before = await self.memory.query_facts(
+                agent_id=ANCHOR_AGENT_ID, limit=1000,
+            )
+            before_count = sum(
+                1 for f in before if f.get("name", "").startswith(f"{name}.")
+            )
+
+            await self.memory._db.query(
                 "DELETE FROM fact WHERE agent_id = $agent_id AND "
                 "name CONTAINS $prefix",
                 {"agent_id": ANCHOR_AGENT_ID, "prefix": f"{name}."},
             )
-            count = len(result) if isinstance(result, list) else 0
-            logger.info("AnchorManager: deleted %d facts for %s", count, name)
-            return count
+
+            logger.info("AnchorManager: deleted %d facts for %s", before_count, name)
+            return before_count
         except Exception as e:
             logger.warning("Anchor delete_from_db %s failed: %s", name, e)
             return 0
