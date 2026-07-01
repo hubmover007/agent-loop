@@ -152,9 +152,10 @@ class AmmoBox:
     # ── Compaction ───────────────────────────────────────────────
 
     def compact_workspace(self) -> str:
-        """Compress workspace items into a summary.
+        """Compress workspace items into a summary (rule-based, fast).
 
-        Returns the summary string. Old workspace items are replaced.
+        Only called when context > 70%. For smarter compaction,
+        use smart_compact() with LLM.
         """
         if not self.workspace:
             return ""
@@ -185,27 +186,135 @@ class AmmoBox:
                      len(summary_parts), self._compaction_count, summary_item.token_est)
         return summary_item.content
 
-    def clean_failed_steps(self) -> int:
-        """Remove workspace items from failed steps.
+    async def smart_compact(self, llm: Any, task_scope: str) -> str:
+        """LLM-driven intelligent compaction.
 
-        Returns count of removed items.
+        Asks LLM to classify workspace items into:
+          - KEEP: valuable for task completion
+          - COMPRESS: can be summarized
+          - DISCARD: no value
+
+        Called when context > 70% and LLM is available.
+        """
+        if not self.workspace or not llm:
+            return self.compact_workspace()
+
+        items_text = "\n".join(
+            f"[{i}] {w.content[:200]}"
+            for i, w in enumerate(self.workspace)
+        )
+
+        prompt = f"""任务: {task_scope}
+
+以下是执行过程中的 workspace 记录:
+
+{items_text}
+
+请分类:
+1. KEEP: 对完成任务有价值的记录（关键发现、成功验证、重要中间结果、错误中的教训）
+2. COMPRESS: 可压缩成摘要的记录（冗长输出、重复信息）
+3. DISCARD: 可丢弃的记录（完全无关、空内容）
+
+只返回 JSON，格式: {{"keep": [序号], "compress": [序号], "discard": [序号]}}"""
+
+        try:
+            resp = await llm.chat([
+                {"role": "system", "content": "You are a context management assistant."},
+                {"role": "user", "content": prompt},
+            ])
+
+            from .utils import extract_json_from_llm_response
+            classification = extract_json_from_llm_response(resp.content, default={})
+
+            keep_ids = set(classification.get("keep", []))
+            compress_ids = set(classification.get("compress", []))
+            discard_ids = set(classification.get("discard", []))
+
+            # Execute classification
+            new_workspace = []
+            compressed_parts = []
+
+            for i, w in enumerate(self.workspace):
+                if i in keep_ids:
+                    new_workspace.append(w)
+                elif i in compress_ids:
+                    compressed_parts.append(w.content[:100])
+                # discard: skip
+
+            # Add compressed summary if any items were compressed
+            if compressed_parts:
+                summary = " | ".join(compressed_parts)
+                new_workspace.append(AmmoItem(
+                    content=f"[压缩摘要] {summary[:400]}",
+                    source="smart_compacted",
+                    priority=5,
+                    token_est=self._est_tokens(summary),
+                ))
+
+            # Recalculate tokens
+            for w in self.workspace:
+                self._total_tokens -= w.token_est
+            for w in new_workspace:
+                self._total_tokens += w.token_est
+
+            self.workspace = new_workspace
+            self._compaction_count += 1
+
+            logger.info("AmmoBox: smart_compact — keep=%d, compress=%d, discard=%d",
+                       len(keep_ids), len(compress_ids), len(discard_ids))
+            return f"[智能压缩] 保留{len(keep_ids)}条, 压缩{len(compress_ids)}条, 丢弃{len(discard_ids)}条"
+
+        except Exception as e:
+            logger.warning("AmmoBox: smart_compact failed, falling back to rule-based: %s", e)
+            return self.compact_workspace()
+
+    def clean_workspace_rules(self) -> int:
+        """Rule-based cleaning — only remove clearly useless items.
+
+        Safe rules (no LLM needed):
+          1. Empty content
+          2. Exact duplicates
+          3. Tool output > 500 tokens (keep first 100 chars as summary)
+
+        Does NOT remove error/failed items (they may contain valuable info).
         """
         before = len(self.workspace)
-        # Keep only items that don't contain error indicators
-        error_markers = ["error", "failed", "traceback", "exception", "错误"]
-        self.workspace = [
-            w for w in self.workspace
-            if not any(m in w.content.lower() for m in error_markers)
-        ]
+        seen_content: set[str] = set()
+        cleaned: list[AmmoItem] = []
+
+        for w in self.workspace:
+            content = w.content.strip()
+            # Rule 1: skip empty
+            if not content:
+                self._total_tokens -= w.token_est
+                continue
+            # Rule 2: skip exact duplicates
+            content_key = content[:200]  # first 200 chars as dedup key
+            if content_key in seen_content:
+                self._total_tokens -= w.token_est
+                continue
+            seen_content.add(content_key)
+            # Rule 3: truncate overly long tool outputs
+            if w.token_est > 500:
+                old_est = w.token_est
+                w.content = w.content[:200] + "...[truncated]"
+                w.token_est = self._est_tokens(w.content)
+                self._total_tokens -= (old_est - w.token_est)
+
+            cleaned.append(w)
+
+        self.workspace = cleaned
         removed = before - len(self.workspace)
         if removed > 0:
-            # Recalculate tokens
-            self._total_tokens = sum(
-                item.token_est for item in
-                self.pinned + self.decisions + self.facts + self.findings + self.workspace
-            )
-            logger.debug("AmmoBox: cleaned %d failed step items", removed)
+            logger.debug("AmmoBox: rule-cleaned %d workspace items", removed)
         return removed
+
+    def clean_failed_steps(self) -> int:
+        """Deprecated: use clean_workspace_rules() instead.
+
+        Kept for backward compat. Now just calls clean_workspace_rules().
+        """
+        return self.clean_workspace_rules()
 
     # ── Stats ────────────────────────────────────────────────────
 
@@ -323,11 +432,16 @@ class AmmoRefiller:
         phase = ctx.get("phase", "")
         step_num = ctx.get("step_num", 0)
 
-        # Trigger 1: context too full → compact
+        # Trigger 1: context too full → smart compact (LLM-driven)
         ws_tokens = ctx.get("workspace_tokens", 0)
         total = self.ammo.token_usage() + ws_tokens
         if total > 0 and total / (self.ammo.max_tokens + 4000) > 0.7:
-            self.ammo.compact_workspace()
+            task_scope = ctx.get("user_input", "")
+            if self.llm and task_scope:
+                # Use LLM to intelligently classify what to keep/compress/discard
+                await self.ammo.smart_compact(self.llm, task_scope)
+            else:
+                self.ammo.compact_workspace()
             actions["compacted"] = True
             self._refill_count += 1
 
@@ -366,8 +480,8 @@ class AmmoRefiller:
                 self._write_finding(step_desc)
                 actions["finding_written"] = True
 
-        # Clean failed steps after each check
-        removed = self.ammo.clean_failed_steps()
+        # Rule-based cleaning (safe, no LLM) — only removes clearly useless items
+        removed = self.ammo.clean_workspace_rules()
         if removed > 0:
             actions["cleaned"] = removed
 
