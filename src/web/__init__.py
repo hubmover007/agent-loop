@@ -21,6 +21,8 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import Any
 
+from pathlib import Path
+
 from ..core import TaskStatus, AgentStatus, LoopPhase
 from ..loop_engine import LLMProvider, LoopConfig
 from ..loop_engine.main_loop import MainLoop, LoopContext
@@ -284,9 +286,33 @@ def create_app(memory: MemoryPool, llm: LLMProvider,
         except Exception as e:
             logger.error("WebSocket error: %s", e)
 
-    @app.get("/")
-    async def root():
-        """Root endpoint with API info."""
+    @app.get("/api/metrics")
+    async def get_metrics():
+        """Prometheus metrics endpoint."""
+        from ..metrics import get_collector
+        from fastapi.responses import PlainTextResponse
+        text = get_collector().format_prometheus()
+        return PlainTextResponse(content=text)
+
+    @app.get("/metrics")
+    async def get_metrics_prom():
+        """Prometheus metrics endpoint (standard path)."""
+        from ..metrics import get_collector
+        from fastapi.responses import PlainTextResponse
+        text = get_collector().format_prometheus()
+        return PlainTextResponse(content=text)
+
+    @app.get("/api/traces")
+    async def get_traces():
+        """Get distributed traces from the Tracer."""
+        tracer = getattr(main_loop, 'tracer', None)
+        if tracer is None:
+            return {"traces": []}
+        return {"traces": tracer.get_traces()}
+
+    @app.get("/api")
+    async def api_info():
+        """API info endpoint."""
         return {
             "name": "Agent-Loop API",
             "version": "0.1.0",
@@ -298,9 +324,17 @@ def create_app(memory: MemoryPool, llm: LLMProvider,
                 "GET /api/tasks/{id}",
                 "POST /api/tasks/{id}/cancel",
                 "GET /api/agents",
+                "GET /api/traces",
+                "GET /metrics",
                 "WS /ws/stream",
             ],
         }
+
+    # Static file serving for frontend UI (must be last, after all routes)
+    from starlette.staticfiles import StaticFiles
+    web_root = Path(__file__).parent.parent.parent / "web"
+    if web_root.exists():
+        app.mount("/", StaticFiles(directory=str(web_root), html=True), name="static")
 
     return app
 

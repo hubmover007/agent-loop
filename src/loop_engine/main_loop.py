@@ -26,11 +26,13 @@ class MainLoop:
 
     def __init__(self, memory: MemoryPool, llm: LLMProvider,
                  config: LoopConfig | None = None,
-                 state_store: Any | None = None):
+                 state_store: Any | None = None,
+                 tracer: Any | None = None):
         self.memory = memory
         self.llm = llm
         self.config = config or LoopConfig()
         self.state_store = state_store
+        self.tracer = tracer  # Optional Tracer for distributed tracing
 
         # Sub-systems
         from ..tools.base import ToolRegistry
@@ -360,6 +362,19 @@ class MainLoop:
         logger.info("=" * 60)
         logger.info("MainLoop[%s]: START", ctx.session_id)
 
+        # Tracing: start root span
+        loop_span = None
+        if self.tracer:
+            loop_span = self.tracer.start_span("main_loop.run", input=user_input[:100])
+
+        # Metrics: task started
+        try:
+            from ..metrics import get_collector
+            get_collector().inc("agent_loop_tasks_total", {"status": "started"})
+            get_collector().inc("agent_loop_iterations_total")
+        except ImportError:
+            pass
+
         phases = [
             self._input,
             self._retrieve,
@@ -371,11 +386,31 @@ class MainLoop:
         ]
 
         for phase in phases:
+            # Tracing: phase span
+            phase_span = None
+            if self.tracer:
+                phase_span = self.tracer.start_span(f"phase.{phase.__name__}")
             try:
                 await phase(ctx)
+                if self.tracer and phase_span:
+                    self.tracer.end_span(phase_span, "ok")
             except Exception as e:
                 logger.error("Phase %s failed: %s", phase.__name__, e)
                 ctx.errors.append(f"Error in {phase.__name__}: {e}")
+                if self.tracer and phase_span:
+                    self.tracer.end_span(phase_span, "error")
+
+        # Metrics: task completed
+        try:
+            from ..metrics import get_collector
+            status = "success" if not ctx.errors else "failed"
+            get_collector().inc("agent_loop_tasks_total", {"status": status})
+        except ImportError:
+            pass
+
+        # Tracing: end root span
+        if self.tracer and loop_span:
+            self.tracer.end_span(loop_span, "error" if ctx.errors else "ok")
 
         logger.info("MainLoop[%s]: END", ctx.session_id)
         return ctx.final_output

@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agent-Loop Console</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <nav class="sidebar">
+        <h1>🐕 Agent-Loop</h1>
+        <a href="#dashboard" class="nav-link active" data-view="dashboard">📊 Dashboard</a>
+        <a href="#agents" class="nav-link" data-view="agents">🤖 Agents</a>
+        <a href="#tasks" class="nav-link" data-view="tasks">📋 Tasks</a>
+        <a href="#chat" class="nav-link" data-view="chat">💬 Chat</a>
+        <a href="#traces" class="nav-link" data-view="traces">🔍 Traces</a>
+        <a href="#metrics" class="nav-link" data-view="metrics">📈 Metrics</a>
+        <div class="sidebar-footer">
+            <span class="status-dot" id="ws-status"></span>
+            <span id="ws-status-text">Disconnected</span>
+        </div>
+    </nav>
+    <main class="content">
+        <!-- Dashboard -->
+        <div id="view-dashboard" class="view active">
+            <h2>Dashboard</h2>
+            <div class="dashboard-grid">
+                <div class="card">
+                    <h3>Status</h3>
+                    <div class="stat"><span class="label">Loop Phase</span><span class="value" id="d-phase">-</span></div>
+                    <div class="stat"><span class="label">Active Loops</span><span class="value" id="d-active-loops">0</span></div>
+                    <div class="stat"><span class="label">Model</span><span class="value" id="d-model">-</span></div>
+                </div>
+                <div class="card">
+                    <h3>Pipeline</h3>
+                    <div class="stat"><span class="label">Total</span><span class="value" id="d-total">0</span></div>
+                    <div class="stat"><span class="label">Pending</span><span class="value" id="d-pending">0</span></div>
+                    <div class="stat"><span class="label">Running</span><span class="value" id="d-running">0</span></div>
+                    <div class="stat"><span class="label">Done</span><span class="value ok" id="d-done">0</span></div>
+                    <div class="stat"><span class="label">Failed</span><span class="value err" id="d-failed">0</span></div>
+                </div>
+                <div class="card">
+                    <h3>Agents</h3>
+                    <div class="stat"><span class="label">Active</span><span class="value" id="d-agents-active">0</span></div>
+                    <div class="stat"><span class="label">Idle</span><span class="value" id="d-agents-idle">0</span></div>
+                    <div class="stat"><span class="label">Inflight</span><span class="value" id="d-inflight">0</span></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Agents -->
+        <div id="view-agents" class="view">
+            <h2>Agents</h2>
+            <div id="agents-list" class="list-container">Loading...</div>
+        </div>
+
+        <!-- Tasks -->
+        <div id="view-tasks" class="view">
+            <h2>Tasks</h2>
+            <div id="tasks-list" class="list-container">Loading...</div>
+        </div>
+
+        <!-- Chat -->
+        <div id="view-chat" class="view">
+            <h2>Chat</h2>
+            <div class="chat-container">
+                <div id="chat-messages" class="chat-messages"></div>
+                <div class="chat-input-area">
+                    <textarea id="chat-input" rows="3" placeholder="Type your message..."></textarea>
+                    <div class="chat-controls">
+                        <label><input type="checkbox" id="chat-thinking"> Thinking</label>
+                        <button id="chat-send" class="btn">Send</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Traces -->
+        <div id="view-traces" class="view">
+            <h2>Traces</h2>
+            <div id="traces-list" class="list-container">Loading...</div>
+        </div>
+
+        <!-- Metrics -->
+        <div id="view-metrics" class="view">
+            <h2>Metrics</h2>
+            <pre id="metrics-content">Loading...</pre>
+        </div>
+    </main>
+    <script src="/app.js"></script>
+</body>
+</html>

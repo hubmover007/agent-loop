@@ -12,10 +12,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
@@ -192,3 +194,95 @@ class ProgressEmitter:
         """Emit a tool result event."""
         self.emit("tool_result", "EXECUTE", result,
                   tool=tool_name, result=result)
+
+
+# ============================================================
+# Lightweight Distributed Tracing (no OpenTelemetry dependency)
+# ============================================================
+
+
+class TraceSpan:
+    """轻量级追踪 span"""
+
+    def __init__(self, name: str, parent_id: str | None = None):
+        self.span_id = uuid4().hex[:8]
+        self.parent_id = parent_id
+        self.name = name
+        self.start_time = time.time()
+        self.end_time: float | None = None
+        self.attributes: dict[str, Any] = {}
+        self.events: list[dict] = []
+        self.status: str = "ok"  # ok / error
+
+    def set_attribute(self, key: str, value: Any):
+        self.attributes[key] = value
+
+    def add_event(self, name: str, **kwargs):
+        self.events.append({
+            "name": name,
+            "timestamp": time.time(),
+            **kwargs,
+        })
+
+    def finish(self, status: str = "ok"):
+        self.end_time = time.time()
+        self.status = status
+
+    @property
+    def duration_ms(self) -> float:
+        if self.end_time:
+            return (self.end_time - self.start_time) * 1000
+        return 0
+
+    def to_dict(self) -> dict:
+        return {
+            "span_id": self.span_id,
+            "parent_id": self.parent_id,
+            "name": self.name,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "duration_ms": self.duration_ms,
+            "attributes": self.attributes,
+            "events": self.events,
+            "status": self.status,
+        }
+
+
+class Tracer:
+    """轻量级追踪器"""
+
+    def __init__(self):
+        self._spans: list[TraceSpan] = []
+        self._current: TraceSpan | None = None
+
+    def start_span(self, name: str, **attributes) -> TraceSpan:
+        parent_id = self._current.span_id if self._current else None
+        span = TraceSpan(name, parent_id)
+        span.set_attribute("component", "agent-loop")
+        for k, v in attributes.items():
+            span.set_attribute(k, v)
+        self._spans.append(span)
+        self._current = span
+        return span
+
+    def end_span(self, span: TraceSpan, status: str = "ok"):
+        span.finish(status)
+        # 恢复 parent 为 current
+        if span.parent_id:
+            found = False
+            for s in reversed(self._spans):
+                if s.span_id == span.parent_id and s.end_time is None:
+                    self._current = s
+                    found = True
+                    break
+            if not found:
+                self._current = None
+        else:
+            self._current = None
+
+    def get_traces(self) -> list[dict]:
+        return [s.to_dict() for s in self._spans]
+
+    def clear(self):
+        self._spans.clear()
+        self._current = None

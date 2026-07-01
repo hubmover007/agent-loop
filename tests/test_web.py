@@ -136,10 +136,9 @@ async def test_not_found(create_app_client):
 
 @pytest.mark.asyncio
 async def test_root_endpoint(create_app_client):
-    """GET / returns API info."""
+    """GET / serves frontend index.html."""
     async with create_app_client as client:
         resp = await client.get("/")
         assert resp.status_code == 200
-        data = resp.json()
-        assert data["name"] == "Agent-Loop API"
-        assert "endpoints" in data
+        text = resp.text
+        assert "Agent-Loop" in text or "text/html" in resp.headers.get("content-type", "")
