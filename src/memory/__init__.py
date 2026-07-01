@@ -12,7 +12,7 @@ All layers connected by semantic edges with vectorized descriptions.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, TYPE_CHECKING
 
 from ..core import MemoryLayer
@@ -145,10 +145,13 @@ class MemoryPool:
         with open(schema_path) as f:
             schema_sql = f.read()
 
-        # Execute each statement separately
+        # Execute each statement separately, stripping comment lines
         for statement in schema_sql.split(";\n"):
-            statement = statement.strip()
-            if statement and not statement.startswith("--"):
+            # Filter out comment lines and blank lines
+            lines = [line for line in statement.split("\n")
+                     if line.strip() and not line.strip().startswith("--")]
+            statement = "\n".join(lines).strip()
+            if statement:
                 try:
                     await self._db.query(statement)
                 except Exception as e:
@@ -336,18 +339,25 @@ class MemoryPool:
 
     async def write_fact(self, fact_type: str, name: str, value: Any = None,
                          embedding_text: str | None = None,
-                         upsert: bool = True) -> str:
+                         upsert: bool = True,
+                         agent_id: str = "shared") -> str:
         """Write a Fact (entity or facetpoint) to Layer 0.
 
-        By default uses upsert semantics: if a fact with the same name already
-        exists, it updates the existing record instead of creating a duplicate.
-        Set upsert=False to enforce strict create-only behavior.
+        By default uses upsert semantics: if a fact with the same (fact_type,
+        name, agent_id) already exists, it updates the existing record instead
+        of creating a duplicate. Set upsert=False to enforce strict
+        create-only behavior.
+
+        Args:
+            agent_id: Namespace isolation key (defaults to "shared" for
+                      backward compatibility).
         """
         embedding = await self.embed(embedding_text or name) if self._embedding_fn else None
         record = {
             "fact_type": fact_type,
             "name": name,
             "value": value,
+            "agent_id": agent_id,
             "embedding": embedding or [],
             "updated_at": datetime.now(timezone.utc),
         }
@@ -355,10 +365,14 @@ class MemoryPool:
             try:
                 result = await self._db.create("fact", record)
             except Exception as e:
-                if upsert and "already exists" in str(e).lower():
+                if upsert and ("already exists" in str(e).lower()
+                               or "already contains" in str(e).lower()):
                     result = await self._db.query(
-                        "UPDATE fact MERGE $record WHERE name = $name RETURN AFTER",
-                        {"name": name, "record": record}
+                        "UPDATE fact MERGE $record"
+                        " WHERE fact_type = $fact_type AND name = $name"
+                        " AND agent_id = $agent_id RETURN AFTER",
+                        {"fact_type": fact_type, "name": name,
+                         "agent_id": agent_id, "record": record}
                     )
                     rows = result if isinstance(result, list) else result.get("result", [])
                     if rows:
@@ -486,20 +500,62 @@ class MemoryPool:
     # Read Operations
     # ============================================================
 
-    async def get_fact(self, name: str) -> dict | None:
-        """Get a Fact by name."""
+    async def get_fact(self, name: str,
+                       agent_id: str | None = None) -> dict | None:
+        """Get a Fact by name (optionally scoped to an agent)."""
         if self._db:
-            result = await self._db.query(
-                "SELECT * FROM fact WHERE name = $name LIMIT 1",
-                {"name": name}
-            )
+            if agent_id:
+                result = await self._db.query(
+                    "SELECT * FROM fact WHERE name = $name AND agent_id = $agent_id LIMIT 1",
+                    {"name": name, "agent_id": agent_id}
+                )
+            else:
+                result = await self._db.query(
+                    "SELECT * FROM fact WHERE name = $name LIMIT 1",
+                    {"name": name}
+                )
             rows = result if isinstance(result, list) else result.get("result", [])
             return rows[0] if rows else None
         else:
             for r in self._mem.get("fact", []):
                 if r.get("name") == name:
-                    return r
+                    if agent_id is None or r.get("agent_id") == agent_id:
+                        return r
             return None
+
+    async def query_facts(self,
+                          agent_id: str | None = None,
+                          fact_type: str | None = None,
+                          limit: int = 100) -> list[dict]:
+        """Query facts with optional agent_id and fact_type filters.
+
+        Args:
+            agent_id: Filter by agent namespace (None = all agents).
+            fact_type: Filter by fact type ("entity" / "facetpoint").
+            limit: Maximum number of results (default 100).
+        """
+        if self._db:
+            conditions = []
+            params = {"limit": limit}
+            if agent_id:
+                conditions.append("agent_id = $agent_id")
+                params["agent_id"] = agent_id
+            if fact_type:
+                conditions.append("fact_type = $fact_type")
+                params["fact_type"] = fact_type
+            where = " AND ".join(conditions) if conditions else "true"
+            result = await self._db.query(
+                f"SELECT * FROM fact WHERE {where} ORDER BY updated_at DESC LIMIT $limit",
+                params
+            )
+            return result if isinstance(result, list) else result.get("result", [])
+        else:
+            results = self._mem.get("fact", [])
+            if agent_id:
+                results = [r for r in results if r.get("agent_id") == agent_id]
+            if fact_type:
+                results = [r for r in results if r.get("fact_type") == fact_type]
+            return results[:limit]
 
     async def get_facet(self, name: str) -> dict | None:
         """Get a Facet by name."""
@@ -551,6 +607,7 @@ class MemoryPool:
                 name=data_copy.pop("name", ""),
                 value=data_copy.pop("value", None),
                 embedding_text=data_copy.pop("embedding_text", None),
+                agent_id=data_copy.pop("agent_id", "shared"),
             )
         else:
             raise ValueError(f"Unknown record type: {record_type}")
@@ -586,6 +643,120 @@ class MemoryPool:
                 if r.get("id") == episode_id:
                     r["consolidated"] = True
                     break
+
+    # ============================================================
+    # Data Cleanup & Retention
+    # ============================================================
+
+    async def cleanup_stale_episodes(self, days: int = 30) -> int:
+        """Delete episodes older than `days` days.
+
+        Returns the number of episodes deleted.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        if self._db:
+            # Select episodes older than cutoff, then delete them one by one
+            result = await self._db.query(
+                "SELECT id, created_at FROM episode"
+                " WHERE created_at < <datetime>($cutoff)"
+                " ORDER BY created_at ASC LIMIT 1000",
+                {"cutoff": cutoff.isoformat()}
+            )
+            rows = result if isinstance(result, list) else result.get("result", [])
+            deleted = 0
+            for row in rows:
+                eid = row.get("id") if isinstance(row, dict) else row
+                try:
+                    await self._db.query(
+                        "DELETE FROM episode WHERE id = $id", {"id": eid}
+                    )
+                    deleted += 1
+                except Exception as e:
+                    logger.warning("Delete stale episode %s failed: %s", eid, e)
+            if deleted:
+                logger.info(
+                    "MemoryPool: cleaned up %d stale episodes (older than %d days)",
+                    deleted, days
+                )
+            return deleted
+        else:
+            episodes = self._mem.get("episode", [])
+            before_count = len(episodes)
+            cutoff_ts = cutoff.timestamp()
+            kept = [e for e in episodes
+                     if float(e.get("created_at", 0)) > cutoff_ts]
+            self._mem["episode"] = kept
+            deleted = before_count - len(kept)
+            if deleted:
+                logger.info(
+                    "MemoryPool: cleaned up %d stale episodes (older than %d days)",
+                    deleted, days
+                )
+            return deleted
+
+    async def consolidate_episodes_to_facts(self, days: int = 30) -> dict:
+        """Convert old unconsolidated episodes into summary facts, then delete them.
+
+        This is a lightweight consolidation: old episodes are deleted after
+        recording a summary fact. No LLM summarization is performed.
+
+        Args:
+            days: Age threshold in days.
+
+        Returns:
+            dict with 'consolidated' (count of episodes processed) and
+            'deleted' (count of episodes deleted).
+        """
+        if not self._db:
+            return {"consolidated": 0, "deleted": 0}
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        result = await self._db.query(
+            "SELECT id, title, summary, tags, created_at FROM episode"
+            " WHERE (consolidated = false OR consolidated IS NONE)"
+            " AND created_at < <datetime>($cutoff)"
+            " ORDER BY created_at ASC LIMIT 100",
+            {"cutoff": cutoff.isoformat()}
+        )
+        rows = result if isinstance(result, list) else result.get("result", [])
+
+        consolidated_count = 0
+        deleted_count = 0
+
+        for row in rows:
+            try:
+                # Write a summary fact before deleting
+                await self.write_fact(
+                    fact_type="facetpoint",
+                    name=f"consolidated_episode:{row.get('id', 'unknown')}",
+                    value={
+                        "title": row.get("title", ""),
+                        "summary": row.get("summary", ""),
+                        "tags": row.get("tags", []),
+                    },
+                    upsert=False,
+                    agent_id="system",
+                )
+
+                # Delete the episode
+                del_result = await self._db.query(
+                    "DELETE FROM episode WHERE id = $id",
+                    {"id": row["id"]}
+                )
+                deleted_count += 1
+                consolidated_count += 1
+            except Exception as e:
+                logger.warning(
+                    "Consolidate episode %s failed: %s",
+                    row.get("id", "?"), e
+                )
+
+        if consolidated_count:
+            logger.info(
+                "MemoryPool: consolidated %d episodes into facts, deleted %d",
+                consolidated_count, deleted_count
+            )
+        return {"consolidated": consolidated_count, "deleted": deleted_count}
 
     # ============================================================
     # Graph Traversal

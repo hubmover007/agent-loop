@@ -320,6 +320,62 @@ def cmd_start(args):
     asyncio.run(run())
 
 
+def cmd_stats(args):
+    """Show memory stats."""
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+
+    async def run():
+        from src.memory import MemoryPool
+
+        memory = MemoryPool(args.memory_url)
+        await memory.connect()
+
+        print("=== Memory Pool Stats ===")
+        print()
+
+        # Count facts
+        facts = await memory.query_facts(limit=10000)
+        entity_count = sum(1 for f in facts if f.get("fact_type") == "entity")
+        fp_count = sum(1 for f in facts if f.get("fact_type") == "facetpoint")
+        print(f"Facts: {len(facts)} total ({entity_count} entities, {fp_count} facetpoints)")
+
+        # Count episodes
+        episodes = await memory._db.query("SELECT count() FROM episode GROUP ALL")
+        ep_rows = episodes if isinstance(episodes, list) else episodes.get("result", [])
+        if ep_rows:
+            print(f"Episodes: {ep_rows[0].get('count', 0)}")
+
+        await memory.disconnect()
+
+    asyncio.run(run())
+
+
+def cmd_cleanup(args):
+    """Clean up stale episodes from memory."""
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+
+    async def run():
+        from src.memory import MemoryPool
+
+        memory = MemoryPool(args.memory_url)
+        await memory.connect()
+
+        print(f"=== Memory Cleanup (older than {args.days} days) ===")
+
+        # Step 1: Consolidate unconsolidated old episodes into facts
+        cons_result = await memory.consolidate_episodes_to_facts(days=args.days)
+        print(f"Episodes consolidated → facts: {cons_result['consolidated']}")
+
+        # Step 2: Delete stale episodes
+        deleted = await memory.cleanup_stale_episodes(days=args.days)
+        print(f"Stale episodes deleted: {deleted}")
+
+        print("Cleanup complete.")
+        await memory.disconnect()
+
+    asyncio.run(run())
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="agent-loop",
@@ -360,6 +416,18 @@ def main():
     p_start.add_argument("--provider", default="deepseek")
     p_start.add_argument("--api-key", default=None)
     p_start.set_defaults(func=cmd_start)
+
+    # stats
+    p_stats = sub.add_parser("stats", help="Show memory pool stats")
+    p_stats.add_argument("--memory-url", default="surrealdb://localhost:8000")
+    p_stats.set_defaults(func=cmd_stats)
+
+    # cleanup
+    p_cleanup = sub.add_parser("cleanup", help="Clean up stale episodes from memory")
+    p_cleanup.add_argument("--days", type=int, default=30,
+                           help="Delete episodes older than N days (default: 30)")
+    p_cleanup.add_argument("--memory-url", default="surrealdb://localhost:8000")
+    p_cleanup.set_defaults(func=cmd_cleanup)
 
     args = parser.parse_args()
     if not args.command:

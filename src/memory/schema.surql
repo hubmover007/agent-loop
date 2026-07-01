@@ -11,14 +11,18 @@ DEFINE FIELD fact_type ON fact TYPE string
 
 -- entity: user:{id}, server:{ip}, tool:{name}
 -- facetpoint: 精确断言，如 "nginx 监听端口 8000"
+-- agent_id: namespace isolation — defaults to "shared" for backward compatibility
 DEFINE FIELD name ON fact TYPE string;
-DEFINE FIELD value ON fact TYPE option;
-DEFINE FIELD embedding ON fact TYPE option;
+DEFINE FIELD value ON fact TYPE any;
+DEFINE FIELD agent_id ON fact TYPE string DEFAULT "shared";
+DEFINE FIELD embedding ON fact TYPE array<float>;
 DEFINE FIELD created_at ON fact TYPE datetime DEFAULT time::now();
 DEFINE FIELD updated_at ON fact TYPE datetime DEFAULT time::now();
 
-DEFINE INDEX idx_fact_name ON fact FIELDS name UNIQUE;
+-- Composite unique: same (fact_type, name) only unique per agent namespace
+DEFINE INDEX idx_fact_name ON fact FIELDS fact_type, name, agent_id UNIQUE;
 DEFINE INDEX idx_fact_type ON fact FIELDS fact_type;
+DEFINE INDEX idx_fact_agent ON fact FIELDS agent_id;
 DEFINE INDEX idx_fact_mtree ON fact FIELDS embedding MTREE DIMENSION 1024 DISTANCE COSINE TYPE F64;
 
 -- ============================================================
@@ -29,7 +33,7 @@ DEFINE TABLE facet SCHEMAFULL;
 -- 例如: "运维:SSH", "飞书:IM", "AWS:EC2"
 DEFINE FIELD name ON facet TYPE string;
 DEFINE FIELD description ON facet TYPE string;
-DEFINE FIELD embedding ON facet TYPE option;
+DEFINE FIELD embedding ON facet TYPE array<float>;
 DEFINE FIELD created_at ON facet TYPE datetime DEFAULT time::now();
 DEFINE FIELD updated_at ON facet TYPE datetime DEFAULT time::now();
 
@@ -44,8 +48,14 @@ DEFINE TABLE episode SCHEMAFULL;
 DEFINE FIELD title ON episode TYPE string;
 DEFINE FIELD summary ON episode TYPE string;
 DEFINE FIELD content ON episode TYPE string;
-DEFINE FIELD embedding ON episode TYPE option;
-DEFINE FIELD tags ON episode TYPE option;
+DEFINE FIELD embedding ON episode TYPE array<float>;
+DEFINE FIELD tags ON episode TYPE array<string>;
+DEFINE FIELD type ON episode TYPE string DEFAULT "episode";
+DEFINE FIELD user_input ON episode TYPE string DEFAULT "";
+DEFINE FIELD output ON episode TYPE string DEFAULT "";
+DEFINE FIELD task_count ON episode TYPE int DEFAULT 0;
+DEFINE FIELD session_id ON episode TYPE string DEFAULT "";
+DEFINE FIELD consolidated ON episode TYPE bool DEFAULT false;
 DEFINE FIELD created_at ON episode TYPE datetime DEFAULT time::now();
 DEFINE FIELD updated_at ON episode TYPE datetime DEFAULT time::now();
 
@@ -60,7 +70,7 @@ DEFINE TABLE project SCHEMAFULL;
 
 DEFINE FIELD name ON project TYPE string;
 DEFINE FIELD description ON project TYPE string;
-DEFINE FIELD embedding ON project TYPE option;
+DEFINE FIELD embedding ON project TYPE array<float>;
 DEFINE FIELD created_at ON project TYPE datetime DEFAULT time::now();
 DEFINE FIELD updated_at ON project TYPE datetime DEFAULT time::now();
 
@@ -77,7 +87,7 @@ DEFINE FIELD source_id ON edge TYPE record;
 DEFINE FIELD target_type ON edge TYPE string;
 DEFINE FIELD target_id ON edge TYPE record;
 DEFINE FIELD relation ON edge TYPE string;
-DEFINE FIELD embedding ON edge TYPE option;
+DEFINE FIELD embedding ON edge TYPE array<float>;
 DEFINE FIELD created_at ON edge TYPE datetime DEFAULT time::now();
 
 DEFINE INDEX idx_edge_source ON edge FIELDS source_id;
@@ -108,21 +118,21 @@ DEFINE TABLE references_episode SCHEMAFULL TYPE RELATION IN fact OUT episode;
 DEFINE TABLE agent_registry SCHEMAFULL;
 DEFINE FIELD agent_id ON agent_registry TYPE string;
 DEFINE FIELD status ON agent_registry TYPE string;
-DEFINE FIELD expert_profile ON agent_registry TYPE option;
+DEFINE FIELD expert_profile ON agent_registry TYPE any;
 DEFINE FIELD created_at ON agent_registry TYPE datetime DEFAULT time::now();
-DEFINE FIELD destroyed_at ON agent_registry TYPE option;
+DEFINE FIELD destroyed_at ON agent_registry TYPE option<datetime>;
 DEFINE INDEX idx_agent_id ON agent_registry FIELDS agent_id UNIQUE;
 
 -- 任务表
 DEFINE TABLE task_registry SCHEMAFULL;
 DEFINE FIELD task_id ON task_registry TYPE string;
-DEFINE FIELD parent_id ON task_registry TYPE option;
+DEFINE FIELD parent_id ON task_registry TYPE option<string>;
 DEFINE FIELD scope ON task_registry TYPE string;
 DEFINE FIELD status ON task_registry TYPE string;
 DEFINE FIELD priority ON task_registry TYPE int;
-DEFINE FIELD assigned_agent ON task_registry TYPE option;
-DEFINE FIELD branch_space ON task_registry TYPE option;
-DEFINE FIELD result ON task_registry TYPE option;
+DEFINE FIELD assigned_agent ON task_registry TYPE option<string>;
+DEFINE FIELD branch_space ON task_registry TYPE option<string>;
+DEFINE FIELD result ON task_registry TYPE any;
 DEFINE FIELD created_at ON task_registry TYPE datetime DEFAULT time::now();
 DEFINE FIELD updated_at ON task_registry TYPE datetime DEFAULT time::now();
 DEFINE INDEX idx_task_id ON task_registry FIELDS task_id UNIQUE;
@@ -133,9 +143,9 @@ DEFINE INDEX idx_task_status ON task_registry FIELDS status;
 DEFINE TABLE discard_pool SCHEMAFULL;
 DEFINE FIELD agent_id ON discard_pool TYPE string;
 DEFINE FIELD task_id ON discard_pool TYPE string;
-DEFINE FIELD result ON discard_pool TYPE option;
+DEFINE FIELD result ON discard_pool TYPE any;
 DEFINE FIELD reason ON discard_pool TYPE string;
-DEFINE FIELD agent_log ON discard_pool TYPE option;
+DEFINE FIELD agent_log ON discard_pool TYPE array<string>;
 DEFINE FIELD discarded_at ON discard_pool TYPE datetime DEFAULT time::now();
 DEFINE INDEX idx_discard_agent ON discard_pool FIELDS agent_id;
 DEFINE INDEX idx_discard_task ON discard_pool FIELDS task_id;
