@@ -204,6 +204,7 @@ class MainLoop:
                 query=ctx.user_input,
                 max_hops=3,
                 deep_reason_iterations=0,
+                project_id=self.project.project_id if self.project else None,
             )
 
             # Store unified context for REASON phase
@@ -546,6 +547,7 @@ class MainLoop:
                     query=ctx.user_input,
                     max_hops=2,
                     deep_reason_iterations=0,  # No deep reasoning for simple queries
+                    project_id=self.project.project_id if self.project else None,
                 ),
                 timeout=10.0,
             )
@@ -673,6 +675,7 @@ class MainLoop:
                     query=ctx.user_input,
                     max_hops=3,
                     deep_reason_iterations=0,
+                    project_id=self.project.project_id if self.project else None,
                 ),
                 timeout=10.0,
             )
@@ -778,19 +781,23 @@ class MainLoop:
         if not self.memory:
             return ""
 
-        project_filter = ""
-        if self.project:
-            project_filter = f"AND project = '{self.project.project_id}'"
-
         try:
             if hasattr(self.memory, '_db') and self.memory._db:
-                result = await self.memory._db.query(f"""
-                    SELECT * FROM episode
-                    WHERE summary != ''
-                    {project_filter}
-                    ORDER BY created_at DESC
-                    LIMIT 5
-                """)
+                if self.project:
+                    result = await self.memory._db.query("""
+                        SELECT * FROM episode
+                        WHERE summary != ''
+                          AND project = $project_id
+                        ORDER BY created_at DESC
+                        LIMIT 5
+                    """, {"project_id": self.project.project_id})
+                else:
+                    result = await self.memory._db.query("""
+                        SELECT * FROM episode
+                        WHERE summary != ''
+                        ORDER BY created_at DESC
+                        LIMIT 5
+                    """)
                 if isinstance(result, list):
                     items = result
                 elif isinstance(result, dict) and "result" in result:

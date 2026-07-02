@@ -124,7 +124,8 @@ class UnifiedRetriever:
         return self.llm
 
     async def retrieve(self, query: str, max_hops: int = 3,
-                       deep_reason_iterations: int = 3) -> MemoryContext:
+                       deep_reason_iterations: int = 3,
+                       project_id: str | None = None) -> MemoryContext:
         """Retrieve unified memory context for a query.
 
         This is the single memory access point. It:
@@ -137,6 +138,7 @@ class UnifiedRetriever:
             query: User's question or task description
             max_hops: Max graph traversal hops (M-FLOW)
             deep_reason_iterations: Max reasoning iterations (Mythos)
+            project_id: If set, filter results to this project only
         """
         context = MemoryContext()
 
@@ -148,6 +150,7 @@ class UnifiedRetriever:
             # Graph routing: anchor search → subgraph extraction → cost propagation
             graph_results = await self.graph_router.retrieve(
                 query=query,
+                project_id=project_id,
             )
 
             # Convert RetrieveResult objects to dicts for MemoryContext

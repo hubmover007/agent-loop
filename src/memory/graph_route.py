@@ -66,12 +66,14 @@ class GraphRouter:
     def __init__(self, pool: MemoryPool):
         self.pool = pool
 
-    async def retrieve(self, query: str, top_k: int = 5) -> list[RetrieveResult]:
+    async def retrieve(self, query: str, top_k: int = 5,
+                       project_id: str | None = None) -> list[RetrieveResult]:
         """Execute graph-routed retrieval for a query.
 
         Args:
             query: Natural language query
             top_k: Number of top episodes to return
+            project_id: If set, filter results to this project only
 
         Returns:
             List of RetrieveResult sorted by score (lower = better)
@@ -79,7 +81,8 @@ class GraphRouter:
         query_embedding = await self.pool.embed(query)
 
         # Phase 1: Broad anchor search across all layers
-        anchors = await self._search_all_layers(query, query_embedding, top_n=100)
+        anchors = await self._search_all_layers(query, query_embedding, top_n=100,
+                                                  project_id=project_id)
 
         if not anchors:
             logger.info("No anchors found for query: %s", query[:50])
@@ -118,27 +121,32 @@ class GraphRouter:
     # ============================================================
 
     async def _search_all_layers(self, query: str, query_embedding: list[float],
-                                  top_n: int = 100) -> list[SearchResult]:
+                                  top_n: int = 100,
+                                  project_id: str | None = None) -> list[SearchResult]:
         """Search across all memory layers simultaneously."""
         anchors = []
 
         # Search Facts (Layer 0 - cone tip, highest precision)
-        fact_anchors = await self._vector_search("fact", query_embedding, top_n)
+        fact_anchors = await self._vector_search("fact", query_embedding, top_n,
+                                                   project_id=project_id)
         anchors.extend(fact_anchors)
 
         # Search Facets (Layer 1)
-        facet_anchors = await self._vector_search("facet", query_embedding, top_n // 2)
+        facet_anchors = await self._vector_search("facet", query_embedding, top_n // 2,
+                                                    project_id=project_id)
         anchors.extend(facet_anchors)
 
         # Search Episodes (Layer 2 - cone base, broad match)
-        episode_anchors = await self._vector_search("episode", query_embedding, top_n // 2)
+        episode_anchors = await self._vector_search("episode", query_embedding, top_n // 2,
+                                                       project_id=project_id)
         # Mark episode anchors for direct-hit penalty
         for a in episode_anchors:
             a.node_type = "episode_direct"
         anchors.extend(episode_anchors)
 
         # Search Projects (Layer 3)
-        project_anchors = await self._vector_search("project", query_embedding, top_n // 4)
+        project_anchors = await self._vector_search("project", query_embedding, top_n // 4,
+                                                      project_id=None)
         anchors.extend(project_anchors)
 
         # Deduplicate by node_id and sort by distance
@@ -152,19 +160,34 @@ class GraphRouter:
         return unique[:top_n]
 
     async def _vector_search(self, table: str, query_embedding: list[float],
-                             top_n: int) -> list[SearchResult]:
-        """Vector similarity search on a table."""
+                             top_n: int,
+                             project_id: str | None = None) -> list[SearchResult]:
+        """Vector similarity search on a table, optionally filtered by project."""
         try:
-            result = await self.pool._db.query(f"""
-                SELECT *, vector::similarity::cosine(embedding, $query_embedding) AS _dist
-                FROM {table}
-                WHERE embedding IS NOT NONE
-                ORDER BY _dist ASC
-                LIMIT $top_n
-            """, {
-                "query_embedding": query_embedding,
-                "top_n": top_n,
-            })
+            if project_id and table in ("episode", "fact"):
+                result = await self.pool._db.query(f"""
+                    SELECT *, vector::similarity::cosine(embedding, $query_embedding) AS _dist
+                    FROM {table}
+                    WHERE embedding IS NOT NONE
+                      AND project = $project_id
+                    ORDER BY _dist ASC
+                    LIMIT $top_n
+                """, {
+                    "query_embedding": query_embedding,
+                    "top_n": top_n,
+                    "project_id": project_id,
+                })
+            else:
+                result = await self.pool._db.query(f"""
+                    SELECT *, vector::similarity::cosine(embedding, $query_embedding) AS _dist
+                    FROM {table}
+                    WHERE embedding IS NOT NONE
+                    ORDER BY _dist ASC
+                    LIMIT $top_n
+                """, {
+                    "query_embedding": query_embedding,
+                    "top_n": top_n,
+                })
             rows = result if isinstance(result, list) else result.get("result", [])
             return [
                 SearchResult(
