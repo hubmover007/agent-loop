@@ -1002,13 +1002,17 @@ Respond with ONLY the JSON array, no other text."""
         # Gather errors
         errors = [s.error for s in steps if s.error]
 
+        # Inject ammo context for eval
+        ammo_ctx = self.get_ammo_context()
+        ammo_section = f"\n\n--- Execution Context ---\n{ammo_ctx}" if ammo_ctx else ""
+
         # Build evaluation prompt
         prompt = f"""You are a quality evaluator. Rate the agent output on a 0-1 scale.
 
 Task: {task_scope}
 Steps completed: {len(steps)}
 Artifacts: {list(artifacts.keys())}
-Errors: {errors if errors else 'none'}
+Errors: {errors if errors else 'none'}{ammo_section}
 
 Output JSON only: {{"score": <number between 0 and 1>, "reason": "<brief explanation>"}}"""
 

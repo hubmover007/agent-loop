@@ -413,6 +413,7 @@ class MainLoop:
                     "task_count": len(ctx.task_ids),
                     "session_id": ctx.session_id,
                     "tags": ["session", "empty"],
+                    "project": self.project.project_id if self.project else "",
                 })
             except Exception as e:
                 logger.warning("Failed to write episode: %s", e)
@@ -821,10 +822,12 @@ class MainLoop:
                     "project": self.project.project_id if self.project else "",
                     "tags": tags or ["session", datetime.now(timezone.utc).strftime("%Y-%m-%d")],
                 }),
-                timeout=3.0,
+                timeout=5.0,
             )
-        except Exception:
-            pass
+        except asyncio.TimeoutError:
+            logger.warning("MainLoop[%s]: _save_episode timed out (5s)", ctx.session_id)
+        except Exception as e:
+            logger.warning("MainLoop[%s]: _save_episode failed: %s", ctx.session_id, e)
 
     async def _save_session(self, ctx: LoopContext) -> None:
         """Save session state to StateStore if available."""
