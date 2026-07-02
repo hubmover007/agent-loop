@@ -39,7 +39,7 @@ PHASE_TIMEOUTS: dict[str, float] = {
     "_reason": 25.0,
     "_decompose": 20.0,
     "_dispatch": 5.0,
-    "_collect": 30.0,
+    "_collect": 60.0,   # Was 30s, now configurable via LoopConfig.collect_timeout
     "_output": 10.0,
 }
 
@@ -360,7 +360,7 @@ class MainLoop:
             return
 
         # AgentManagerAgent waits for all workers to finish (limited to 30s per phase + extra asyncio.wait_for)
-        results = await self.agent_manager.collect_all(timeout=30.0)
+        results = await self.agent_manager.collect_all(timeout=self.config.collect_timeout)
 
         for task_id, result in results.items():
             ctx.agent_results.append(result)
@@ -371,12 +371,22 @@ class MainLoop:
                 ctx.discarded_results.append(task.task_id)
                 ctx.errors.append(f"Task {task.task_id} failed: {task.error}")
 
-                # TaskAgent re-plans failed tasks
-                # new_tasks = await self.task_agent.replan(task)
-                # if new_tasks:
-                #     for nt in new_tasks:
-                #         if await self.agent_manager.assign(nt):
-                #             pass
+                # TaskAgent re-plans failed tasks (with retry limit)
+                if task.retry_count < self.config.max_task_retries:
+                    task.retry_count += 1
+                    try:
+                        new_tasks = await self.task_agent.replan(task)
+                        if new_tasks:
+                            for nt in new_tasks:
+                                await self.agent_manager.assign(nt)
+                            logger.info("MainLoop[%s]: replan task %s → %d new tasks",
+                                       ctx.session_id, task.task_id, len(new_tasks))
+                    except Exception as e:
+                        logger.warning("MainLoop[%s]: replan failed for %s: %s",
+                                      ctx.session_id, task.task_id, e)
+                else:
+                    logger.warning("MainLoop[%s]: task %s exceeded max retries (%d)",
+                                 ctx.session_id, task.task_id, self.config.max_task_retries)
 
         logger.info(
             "MainLoop[%s]: COLLECT → %d results, %d failed",
@@ -458,6 +468,42 @@ class MainLoop:
         await self._save_session(ctx)
 
         logger.info("MainLoop[%s]: OUTPUT completed", ctx.session_id)
+
+        # ── Auto-consolidation (async, non-blocking) ─────────────
+        if self.config.auto_consolidate:
+            asyncio.create_task(self._auto_consolidate())
+
+    async def _auto_consolidate(self) -> None:
+        """Run memory consolidation in background after session.
+
+        Only triggers if enough unconsolidated episodes have accumulated.
+        """
+        try:
+            # Check if enough episodes to justify consolidation
+            if hasattr(self.memory, 'get_unconsolidated_episodes'):
+                episodes = await asyncio.wait_for(
+                    self.memory.get_unconsolidated_episodes(limit=50),
+                    timeout=5.0,
+                )
+                pending = [e for e in episodes if not e.get("consolidated", False)]
+                if len(pending) < self.config.consolidate_min_episodes:
+                    return  # Not enough episodes yet
+
+            logger.info("MainLoop: auto-consolidation starting (%d+ episodes)",
+                       self.config.consolidate_min_episodes)
+            result = await asyncio.wait_for(
+                self.memory.consolidate(
+                    llm_provider=self.llm,
+                    min_episodes=self.config.consolidate_min_episodes,
+                ),
+                timeout=120.0,
+            )
+            logger.info("MainLoop: auto-consolidation done — %s",
+                       result.to_summary() if hasattr(result, 'to_summary') else str(result)[:200])
+        except asyncio.TimeoutError:
+            logger.warning("MainLoop: auto-consolidation timed out")
+        except Exception as e:
+            logger.warning("MainLoop: auto-consolidation failed: %s", e)
 
     # ============================================================
     # Simple Run (fast path for trivial questions)

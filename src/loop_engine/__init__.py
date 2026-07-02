@@ -67,6 +67,17 @@ class LoopConfig:
         "efficiency": 0.15,
     })
 
+    # Collect phase
+    collect_timeout: float = 60.0      # Timeout for collect phase (was hardcoded 30s)
+    max_task_retries: int = 2          # Max replan attempts per failed task
+
+    # SELF_EVAL
+    self_eval_min_complexity: str = "medium"  # Skip SELF_EVAL for simple tasks
+
+    # Consolidation
+    auto_consolidate: bool = True      # Auto-run consolidation after session
+    consolidate_min_episodes: int = 5  # Min episodes before consolidation triggers
+
 
 # ============================================================
 # LLM Provider Interface
@@ -712,20 +723,28 @@ class AgentLoop:
                 _emit("phase_done", "EXECUTE",
                       f"Execution complete: {len([s for s in steps if s.tool_name])} tool calls")
 
-                # Phase 3: SELF_EVAL
-                _emit("phase_start", "SELF_EVAL", "Running self-evaluation")
+                # Phase 3: SELF_EVAL (conditional — skip for simple tasks)
+                # Skip eval only when task is simple AND no replan expected
+                tool_steps = [s for s in steps if s.tool_name]
+                should_eval = len(steps) > 2 or len(tool_steps) > 0 or self.max_replans > 0
 
-                # ── Ammo review before SELF_EVAL ─────────────────
-                if self.ammo_refiller:
-                    try:
-                        await self.ammo_refiller.check_and_refill({
-                            "phase": "SELF_EVAL",
-                            "user_input": task_scope,
-                        })
-                    except Exception as e:
-                        logger.warning("AgentLoop[%s]: ammo review before EVAL failed: %s", agent_id, e)
+                if should_eval:
+                    _emit("phase_start", "SELF_EVAL", "Running self-evaluation")
 
-                eval_score = await self._self_evaluate(task_scope, steps, artifacts)
+                    # ── Ammo review before SELF_EVAL ─────────────────
+                    if self.ammo_refiller:
+                        try:
+                            await self.ammo_refiller.check_and_refill({
+                                "phase": "SELF_EVAL",
+                                "user_input": task_scope,
+                            })
+                        except Exception as e:
+                            logger.warning("AgentLoop[%s]: ammo review before EVAL failed: %s", agent_id, e)
+
+                    eval_score = await self._self_evaluate(task_scope, steps, artifacts)
+                else:
+                    eval_score = 0.8
+                    self._last_eval_reason = "Skipped eval (simple task)"
                 eval_reason = self._last_eval_reason
                 _emit("phase_done", "SELF_EVAL", f"Self-eval score: {eval_score:.2f}")
 
